@@ -32,11 +32,19 @@ be assumed. Review and broader testing remain required.
 
 The intended replacement location, after that blocker is resolved and in a
 separate planned change, is the profile's `plugins/platforms/bluebubbles/`
-directory. Do not run built-in and replacement adapters concurrently against
-one webhook/server. Plugin override and end-to-end BlueBubbles behavior have
-not been verified in a running gateway. Confirm plugin discovery and disable or
-remove conflicting registrations before activation; back up existing profile
-configuration and data. No credentials are included here.
+directory. A user override shadows the bundled plugin but is **not** auto-enabled:
+its profile must explicitly enable `platforms/bluebubbles` in `plugins.enabled`.
+Without this, discovery can log that the override shadows the bundled copy while
+leaving no family-scoped adapter. Isolated real-Hermes multiplex discovery tests
+in `tests/test_plugin_discovery_mux.py` reproduce both the failure and successful
+adapter construction when explicitly enabled. This is a configuration fix, not
+an adapter code change. For a future separately approved deployment, enable it
+in the target profile with `hermes plugins enable platforms/bluebubbles
+--no-allow-tool-override` under that profile's Hermes home; preserve the other
+plugin entries. Do not run built-in and replacement adapters concurrently
+against one webhook/server. Back up existing profile configuration and data.
+Neither a live gateway nor end-to-end BlueBubbles behavior has been tested.
+No credentials are included here.
 
 ## Behavior and limits
 
