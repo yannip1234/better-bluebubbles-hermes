@@ -11,23 +11,24 @@ snapshot of an unmerged PR, not a released upstream component.
 ## Important compatibility blocker
 
 **Do not deploy as a safe replacement yet.** The installed Hermes gateway is
-missing PR #116401's `gateway/run_busy.py` admission receipts for successful
-steering/redirect and plaintext approval. A plugin cannot reliably infer
-whether the runner accepted these events from its generic handled flag (which
-also covers refusal). In real-runner regression tests, steer and interrupt
-return 503 despite having been accepted, and a replay can be processed again.
-A minimal upstream-derived patch is provided separately at
-`patches/hermes-bf0203a-admission-receipts.patch`, for revision `bf0203a` only.
-It was applied and tested to a scratch copy of `gateway/`, not to the installed
-core. It is not a deployment or a substitute for review. The plugin locally adapts
-the missing inline and debounce receipts; it does not repair runner internals.
-The patch marks plaintext approvals accepted before the approval handler runs,
-matching upstream: if that handler raises, an input may be marked accepted even
-though approval resolution failed, and the existing runner can fall through to
-other busy handling. A successful receipt is not proof of completed processing;
-process crashes, cancellation and persistence remain separate failure modes.
-Test approval errors and gateway-wide behavior in an isolated checkout before
-considering any deployment.
+missing admission receipts for successful steering/redirect and plaintext
+approval. A plugin cannot infer acceptance from the generic handled flag, which
+also covers refusal. A patch for revision `bf0203a` only is supplied at
+`patches/hermes-bf0203a-admission-receipts.patch`. It was tested against a scratch
+copy of `gateway/`, not installed or deployed. The plugin locally adapts inline
+and debounce receipts; it cannot repair runner internals without the core patch.
+
+The patch records acceptance as soon as it recognizes a plaintext approval, before
+invoking its handler: a handler can resolve an approval and then raise. It consumes
+exceptions instead of falling
+through to queue/steer, preventing unsafe duplicate handling. This deliberately
+chooses at-most-once admission: if the handler fails before resolving anything,
+the approval may remain pending, and a 200 response is **not** proof of resolution.
+Handler and confirmation-delivery failures are logged; an operator must inspect
+and resolve uncertain approvals. Process crashes, cancellation, cache expiry and
+persistence are separate failure modes. A 503 on queue overflow indicates the
+message was not admitted; BlueBubbles retry behavior is unverified and must not
+be assumed. Review and broader testing remain required.
 
 The intended replacement location, after that blocker is resolved and in a
 separate planned change, is the profile's `plugins/platforms/bluebubbles/`
@@ -70,10 +71,13 @@ empty temporary directory, `HERMES_DISABLE_LAZY_INSTALLS=1`, and
 -p pytest_asyncio.plugin tests`. Disabling auto-loading avoids registering the
 asyncio plugin twice in environments that discover it automatically.
 
-Latest full run: **41 passed** with the patch applied to a scratch gateway copy;
-**37 passed, 4 failed** against the unmodified installed revision (steer,
-interrupt, plaintext yes and no). Tests use the installed Hermes runtime
-packages and a scratch test environment. Two `datetime.utcnow()` deprecation
-warnings and an asyncio fixture-scope warning were reported. The test suite does
-not prove live group privacy, media recovery, approval error handling, or
-cross-platform gateway behavior. No live messages were sent.
+Latest isolated run: **53 passed** with the patch applied to a scratch gateway
+copy. This includes real-runner queue, steer, interrupt, plaintext approval and
+deny, handler/delivery exceptions, replay, and a normal `yes` without a pending
+approval. Four copied upstream gateway test files covering approval routing,
+authority, redirect anchors, and steer/subagent behavior: **19 passed**. The
+installed core remains unmodified and still needs the patch. Four
+`datetime.utcnow()` deprecation warnings and an asyncio fixture-scope warning
+were reported. These tests do not prove live group privacy, media recovery,
+approval resolution on handler failure, or gateway-wide behavior. No live
+messages were sent.

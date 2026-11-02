@@ -1,21 +1,104 @@
-diff --git a/gateway/run_busy.py b/gateway/run_busy.py
-index 2273eefbfb..ea9a5560e6 100644
 --- a/gateway/run_busy.py
 +++ b/gateway/run_busy.py
-@@ -642,6 +656,7 @@ class GatewayBusySessionMixin:
+@@ -363,7 +363,7 @@
+             return False
+ 
+     @staticmethod
+-    def _steer_active_subagents(running_agent: Any, text: str) -> int:
++    def _steer_active_subagents(running_agent: Any, text: str, event=None) -> int:
+         """Queue *text* into every live child of *running_agent*; returns how many accepted it.
+ 
+         A parent blocked inside ``delegate_task`` only drains its own steer queue after the tool
+@@ -385,16 +385,21 @@
+             if not callable(steer):
+                 continue
+             try:
+-                accepted += bool(steer(text))
++                child_accepted = bool(steer(text))
++                if child_accepted and event is not None:
++                    event._gateway_accepted = True
++                accepted += child_accepted
+             except Exception as exc:
+                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
+         return accepted
+ 
+-    def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
++    def _steer_running_agent(self, running_agent: Any, text: str, event=None) -> bool:
+         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
+         :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
+         accepted = bool(running_agent.steer(text))
+-        return bool(self._steer_active_subagents(running_agent, text)) or accepted
++        if accepted and event is not None:
++            event._gateway_accepted = True
++        return bool(self._steer_active_subagents(running_agent, text, event)) or accepted
+ 
+     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
+         """True when a compression lock is held for this session's id (callers demote interrupt →
+@@ -634,6 +639,8 @@
+                 _raw_text = (event.text or "").strip().lower()
+                 _match = self._plaintext_approval_words().get(_raw_text)
+                 if _match is not None:
++                    # A recognized approval must never fall through to ordinary input.
++                    event._gateway_accepted = True
+                     _verb, _normalized_args = _match
+                     _approval_handler = (
+                         self._handle_approve_command if _verb == "approve" else self._handle_deny_command
+@@ -642,7 +649,13 @@
                      # event.get_command_args(). Always a literal "/": is_command()/get_command_args()
                      # don't recognize per-platform display prefixes ("!" on Slack/Matrix).
                      event.text = f"/{_verb} {_normalized_args}".rstrip()
-+                    event._gateway_accepted = True
-                     _reply = await _approval_handler(event)
+-                    _reply = await _approval_handler(event)
++                    # Once invoked the handler may have resolved approval even if it raises.
++                    # Consume this input at most once; never fall through to queue/steer.
++                    try:
++                        _reply = await _approval_handler(event)
++                    except Exception:
++                        logger.exception("Plain-text approval outcome uncertain for session %s", session_key)
++                        return True
                      logger.info(
                          "Approval response via plain text: session=%s verb=%s args=%r",
-@@ -709,6 +724,8 @@ class GatewayBusySessionMixin:
-             redirected = self._redirect_active_turn(
-                 running_agent, (event.text or "").strip(), session_key, event
-             )
-+        if steered or redirected:
-+            event._gateway_accepted = True
-         return self._BusySteerOutcome(
-             effective_mode=effective_mode, demoted_for_subagents=demoted_for_subagents,
-             demoted_for_compression=demoted_for_compression, steered=steered, redirected=redirected,
+                         session_key, _verb, _normalized_args,
+@@ -654,6 +667,9 @@
+                             await self._send_busy_reply(event, _adapter, _text, plain_anchor=True)
+                     return True
+         except Exception:
++            if getattr(event, "_gateway_accepted", False):
++                logger.exception("Plain-text approval post-processing failed for session %s", session_key)
++                return True
+             logger.warning(
+                 "Plain-text approval routing failed for session %s; "
+                 "falling through to busy handling", session_key, exc_info=True,
+@@ -698,6 +714,7 @@
+                     running_agent, "steer", steer_text, session_key, event=event
+                 )
+             if steered:
++                event._gateway_accepted = True
+                 self._fold_into_running_turn(running_agent, session_key, event)
+             else:
+                 effective_mode = "queue"
+@@ -726,11 +743,14 @@
+         try:
+             call_text = self._steer_text_with_origin(text, event) if event else text
+             if verb == "steer":
+-                return self._steer_running_agent(running_agent, call_text)
+-            return bool(getattr(running_agent, verb)(call_text))
++                return self._steer_running_agent(running_agent, call_text, event)
++            accepted = bool(getattr(running_agent, verb)(call_text))
++            if accepted and event is not None:
++                event._gateway_accepted = True
++            return accepted
+         except Exception as exc:
+             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
+-            return False
++            return bool(event and getattr(event, "_gateway_accepted", False))
+ 
+     def _redirect_active_turn(self, running_agent, text: str, session_key: str, event: MessageEvent) -> bool:
+         """``redirect()`` the running turn onto *event* and re-anchor its delivery to that message.
+@@ -742,6 +762,7 @@
+         """
+         if not self._try_agent_verb(running_agent, "redirect", text, session_key, event=event):
+             return False
++        event._gateway_accepted = True
+         turn = self._fold_into_running_turn(running_agent, session_key, event)
+         if turn is None:
+             return True  # a newer turn already owns the slot; never re-anchor it

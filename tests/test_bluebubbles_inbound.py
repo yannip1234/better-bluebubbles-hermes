@@ -628,3 +628,125 @@ class TestBlueBubblesAdmissionBoundaries:
         for _ in range(2):
             assert (await adapter._handle_webhook(_FakeBlueBubblesRequest(data))).status == 200
         assert handler.await_count == 1
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stage", ["before_resolution", "after_resolution", "reply"])
+    @pytest.mark.parametrize("text,handler_name", [("yes", "_handle_approve_command"), ("no", "_handle_deny_command")])
+    async def test_approval_failure_never_falls_through_or_replays(self, monkeypatch, stage, text, handler_name):
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+        import tools.approval
+
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        monkeypatch.setattr(tools.approval, "has_blocking_approval", lambda key: True)
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        adapter.set_message_handler(AsyncMock())
+        runner = GatewayRunner(GatewayConfig())
+        runner.adapters = {Platform.BLUEBUBBLES: adapter}
+        runner._busy_input_mode = "queue"
+        resolved = []
+        async def fail_at_stage(event):
+            if stage != "before_resolution":
+                resolved.append(text)
+            if stage != "reply":
+                raise RuntimeError("uncertain")
+            return "confirmation"
+        handler = AsyncMock(side_effect=fail_at_stage)
+        monkeypatch.setattr(runner, handler_name, handler)
+        monkeypatch.setattr(runner, "_send_busy_reply", AsyncMock(side_effect=RuntimeError("delivery failed")))
+        adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+        source = adapter.build_source(chat_id="+155****0100", chat_type="dm", user_id="+155****0100")
+        key = adapter._source_session_key(source)
+        adapter._active_sessions[key] = asyncio.Event()
+        data = self._payload(chat={"guid": "any;-;+155****0100"}, text=text)
+        for _ in range(2):
+            assert (await adapter._handle_webhook(_FakeBlueBubblesRequest(data))).status == 200
+        assert handler.await_count == 1
+        assert resolved == ([] if stage == "before_resolution" else [text])
+        assert key not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode,failure", [("steer", "fanout"), ("steer", "fold"), ("interrupt", "fold")])
+    async def test_accepted_steer_survives_bookkeeping_failure(self, monkeypatch, mode, failure):
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        adapter.set_message_handler(AsyncMock())
+        runner = GatewayRunner(GatewayConfig())
+        runner.adapters = {Platform.BLUEBUBBLES: adapter}
+        runner._busy_input_mode = mode
+        runner._busy_text_mode = "interrupt"
+        calls = []
+        class Receiver:
+            _supports_active_turn_redirect = True
+            def steer(self, text):
+                calls.append(text)
+                return True
+            redirect = steer
+        def fail(*args, **kwargs):
+            raise RuntimeError("bookkeeping failure")
+        monkeypatch.setattr(runner, "_steer_active_subagents" if failure == "fanout" else "_fold_into_running_turn", fail)
+        adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+        source = adapter.build_source(chat_id="+155****0100", chat_type="dm", user_id="+155****0100")
+        key = adapter._source_session_key(source)
+        adapter._active_sessions[key] = asyncio.Event()
+        runner._session_state(key).turn.agent = Receiver()
+        data = self._payload(chat={"guid": "any;-;+155****0100"})
+        for _ in range(2):
+            await adapter._handle_webhook(_FakeBlueBubblesRequest(data))
+        assert len(calls) == 1
+        assert key not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("capacity", [0, 1])
+    async def test_failed_steer_falls_back_to_queue_or_overflow(self, monkeypatch, capacity):
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        adapter.set_message_handler(AsyncMock())
+        runner = GatewayRunner(GatewayConfig())
+        runner.adapters = {Platform.BLUEBUBBLES: adapter}
+        runner._busy_input_mode = "steer"
+        runner._BUSY_QUEUE_MAX_PENDING = capacity
+        receiver = type("Receiver", (), {"steer": lambda self, text: False})()
+        adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+        source = adapter.build_source(chat_id="+155****0100", chat_type="dm", user_id="+155****0100")
+        key = adapter._source_session_key(source)
+        adapter._active_sessions[key] = asyncio.Event()
+        runner._session_state(key).turn.agent = receiver
+        data = self._payload(chat={"guid": "any;-;+155****0100"})
+        result = await adapter._handle_webhook(_FakeBlueBubblesRequest(data))
+        assert result.status == (200 if capacity else 503)
+        assert (key in adapter._pending_messages) == bool(capacity)
+        if capacity:
+            assert (await adapter._handle_webhook(_FakeBlueBubblesRequest(data))).status == 200
+            assert runner._queue_depth(key, adapter=adapter) == 1
+
+    @pytest.mark.asyncio
+    async def test_plain_yes_without_pending_approval_is_queued(self, monkeypatch):
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+        import tools.approval
+
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+        monkeypatch.setattr(tools.approval, "has_blocking_approval", lambda key: False)
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        adapter.set_message_handler(AsyncMock())
+        runner = GatewayRunner(GatewayConfig())
+        runner.adapters = {Platform.BLUEBUBBLES: adapter}
+        runner._busy_input_mode = "queue"
+        handler = AsyncMock()
+        monkeypatch.setattr(runner, "_handle_approve_command", handler)
+        adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+        source = adapter.build_source(chat_id="+155****0100", chat_type="dm", user_id="+155****0100")
+        key = adapter._source_session_key(source)
+        adapter._active_sessions[key] = asyncio.Event()
+        data = self._payload(chat={"guid": "any;-;+155****0100"}, text="yes")
+        assert (await adapter._handle_webhook(_FakeBlueBubblesRequest(data))).status == 200
+        assert adapter._pending_messages[key].text == "yes"
+        handler.assert_not_awaited()
