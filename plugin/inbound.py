@@ -442,7 +442,7 @@ class BlueBubblesInboundMixin:
                                 chat_identifier, chat_id)
         source = self.build_source(chat_id=chat_id, chat_name=chat_name,
                                    chat_type="group" if is_group else "dm", user_id=sender, user_name=sender,
-                                   chat_id_alt=chat_identifier)
+                                   chat_id_alt=chat_identifier, message_id=message_id)
         event = MessageEvent(
             text=text, message_type=msg_type, source=source,
             raw_message={**payload, "data": deepcopy(record)}, message_id=message_id,

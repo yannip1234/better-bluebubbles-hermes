@@ -1,6 +1,8 @@
 name: bluebubbles-platform
 label: BlueBubbles (iMessage)
 kind: platform
+provides_tools:
+  - bluebubbles_tapback
 version: 1.0.0
 description: >
   BlueBubbles (Apple iMessage) gateway adapter for Hermes Agent.

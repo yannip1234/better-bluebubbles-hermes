@@ -35,6 +35,12 @@ with _profile_runtime_scope(profile, hydrate_secrets=False):
     manager = get_plugin_manager()
     manager.discover_and_load()
     record = manager._plugins['platforms/bluebubbles']
+    from tools.registry import registry
+    if os.environ['EXPECT_ENABLED'] == 'yes':
+        assert registry.get_entry('bluebubbles_tapback') is not None
+        assert 'bluebubbles_tapback' in record.tools_registered
+        from toolsets import resolve_toolset
+        assert 'bluebubbles_tapback' in resolve_toolset('bluebubbles')
     assert pathlib.Path(record.manifest.path) == target
     runner = SimpleNamespace(config=SimpleNamespace(group_sessions_per_user=False),
         _instantiate_adapter=lambda p,c: GatewayAdapterLifecycleMixin._instantiate_adapter(runner,p,c))
@@ -45,6 +51,14 @@ with _profile_runtime_scope(profile, hydrate_secrets=False):
         assert adapter is not None
         assert pathlib.Path(sys.modules[adapter.__class__.__module__].__file__).parent == target
         assert adapter.gateway_runner is runner
+        # Exercise Hermes' actual deferred pre-registration path with this same
+        # user manifest in isolation, before materializing its adapter.
+        manager.unload()
+        manager._register_deferred_platform(record.manifest)
+        deferred = manager._plugins['platforms/bluebubbles']
+        assert deferred.deferred, deferred
+        assert 'bluebubbles_tapback' in deferred.tools_registered
+        assert registry.get_entry('bluebubbles_tapback') is not None
     else:
         assert not record.enabled and 'not enabled in config' in record.error, record
         assert adapter is None

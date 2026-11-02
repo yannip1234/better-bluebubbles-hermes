@@ -48,6 +48,8 @@ async def test_failure_does_not_record_tapback():
 
 def test_registration_uses_custom_factory():
     class Context:
+        def register_tool(self, **kwargs):
+            self.tool = kwargs
         def register_platform(self, **kwargs):
             self.options = kwargs
     ctx = Context()

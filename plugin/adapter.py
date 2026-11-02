@@ -145,6 +145,12 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         await super()._queue_text_debounce(session_key, event)
         event._gateway_accepted = True
 
+    async def _process_message_background(self, event, session_key):
+        # Core debounce/queue merges update event.message_id, not source.message_id.
+        # Bind the final admitted event anchor before the runner snapshots its context.
+        event.source.message_id = event.message_id
+        return await super()._process_message_background(event, session_key)
+
     # --- API helpers ---
 
     def _api_url(self, path: str) -> str:
@@ -707,6 +713,8 @@ _PLATFORM_HINT = (
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
+    from .tools import register_tools
+    register_tools(ctx)
     ctx.register_platform(
         name="bluebubbles", label="BlueBubbles (iMessage)", adapter_factory=BlueBubblesAdapter,
         dashboard_description="Use Hermes through iMessage via a BlueBubbles server.",

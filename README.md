@@ -61,9 +61,22 @@ No credentials are included here.
   BlueBubbles Private API. Explicit message GUID and Private API/helper are
   required. The six native tapbacks and common emoji aliases are supported.
   Removal only knows reactions sent by this adapter instance; it cannot infer
-  reactions after restart. No live server was contacted. The tool must actually
-  be available to the calling Hermes session; this plugin does not bypass
-  Hermes authorization or add an unrestricted outbound tool.
+  reactions after restart. The `bluebubbles_tapback` agent tool accepts only a
+  reaction name, never a destination. It uses the authenticated gateway turn's
+  current chat and triggering message GUID, with no environment fallback, and
+  requires a live profile-scoped adapter. Queued merged text uses the latest
+  merged message as its anchor. It fails closed outside a BlueBubbles turn.
+  No live server was contacted and no unrestricted outbound tool is enabled.
+
+  For a future separately approved installation **after the blocker above is
+  resolved**, back up the existing profile plugin directory, copy this repo's
+  `plugin/` contents to `~/.hermes/profiles/family/plugins/platforms/bluebubbles/`,
+  explicitly enable `platforms/bluebubbles` as described above, and make the
+  `bluebubbles` toolset available on that platform with
+  `HERMES_HOME="$HOME/.hermes/profiles/family" hermes tools enable bluebubbles --platform bluebubbles`.
+  Restart the family gateway only in a separately authorized maintenance window.
+  Verify actual tool visibility and Private API behavior after deployment; enabling
+  a plugin or toolset does not prove that a particular agent can call it.
 * Incoming tapbacks and self messages remain ignored, as in the bundled adapter.
 
 ## Tests
