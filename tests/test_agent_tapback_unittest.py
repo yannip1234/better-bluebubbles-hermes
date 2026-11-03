@@ -14,6 +14,25 @@ from plugin.tools import tapback
 
 
 class ToolRuntimeTest(unittest.TestCase):
+    def test_classic_and_custom_fail_closed_without_capability_contract(self):
+        adapter = BlueBubblesAdapter(PlatformConfig(extra={"server_url": "http://example.invalid", "password": "fake"}))
+        adapter.client = object()
+        adapter._private_api_enabled = adapter._helper_connected = True
+        adapter._resolve_chat_guid = AsyncMock(return_value="iMessage;+;chat")
+        adapter._post_message = AsyncMock(return_value=SendResult(success=True, message_id="reaction"))
+
+        async def exercise():
+            for reaction in ("love", "like", "dislike", "laugh", "emphasize", "question"):
+                self.assertTrue((await adapter.add_reaction("chat", reaction, "message"))["success"])
+            self.assertEqual([call.args[1]["reaction"] for call in adapter._post_message.await_args_list],
+                             ["love", "like", "dislike", "laugh", "emphasize", "question"])
+            adapter._post_message.reset_mock()
+            for reaction in ("💙", "👍🏽", "👩🏽‍💻", "🇺🇸", "1️⃣", "-💙"):
+                self.assertFalse((await adapter.add_reaction("chat", reaction, "message"))["success"])
+            adapter._post_message.assert_not_awaited()
+
+        asyncio.run(exercise())
+
     def test_scoped_dispatch_and_env_forgery(self):
         adapter = BlueBubblesAdapter(PlatformConfig(extra={"server_url": "http://example.invalid", "password": "fake"}))
         adapter.client = object()

@@ -79,6 +79,27 @@ No credentials are included here.
   a plugin or toolset does not prove that a particular agent can call it.
 * Incoming tapbacks and self messages remain ignored, as in the bundled adapter.
 
+## Arbitrary emoji Tapbacks: blocked on capability negotiation
+
+Arbitrary Unicode Tapbacks are **not implemented** in this connector. The open
+[server PR #839](https://github.com/BlueBubblesApp/bluebubbles-server/pull/839)
+accepts custom emoji in the existing `reaction` field, and uses a leading `-`
+for removal. Its diff does not expose an HTTP capability that proves both the
+server and the currently connected helper support that contract. The ordinary
+`private_api` and `helper_connected` flags do not prove emoji support. The
+[helper PR #78](https://github.com/BlueBubblesApp/bluebubbles-helper/pull/78)
+is a draft that advertises `custom_emoji_reactions` to the server in the helper
+ping; that alone does not establish an HTTP capability available to this client.
+Do not assume an OS or version number, a connected helper, or a local opt-in
+proves runtime capability. The related helper PR #68 is closed.
+
+Until a server-level runtime capability contract is available, custom emoji
+fail closed and classic Tapbacks remain unchanged. Implementation will also
+need to address capability changes/disconnects, Unicode single-emoji validation
+(including ZWJ, skin tones, flags and keycaps), alias collisions with classic
+Tapbacks, safe add/remove semantics, and actual delivery verification. Mock
+transport tests cannot prove these behaviors on the target Messages runtime.
+
 ## Tests
 
 Tests use synthetic messages and a fake transport; they do not contact an
