@@ -10,13 +10,7 @@ BlueBubbles iMessage platform plugin (`bluebubbles-platform`) for Hermes Agent. 
 
 ## Installation
 
-1. Apply the gateway admission receipt patch to the Hermes checkout if not already applied:
-
-```bash
-git -C ~/.hermes/hermes-agent apply patches/hermes-bf0203a-admission-receipts.patch
-```
-
-2. Copy `plugin/` into each target profile's platform plugin directory:
+1. Copy `plugin/` into each target profile's platform plugin directory:
 
 ```bash
 mkdir -p ~/.hermes/profiles/<profile>/plugins/platforms/bluebubbles
@@ -24,7 +18,7 @@ rsync -av --delete --exclude="__pycache__" plugin/ \
   ~/.hermes/profiles/<profile>/plugins/platforms/bluebubbles/
 ```
 
-3. Enable the plugin and toolset in `config.yaml` for each profile:
+2. Enable the plugin and toolset in `config.yaml` for each profile:
 
 ```yaml
 plugins:
@@ -36,11 +30,23 @@ platform_toolsets:
     - bluebubbles
 ```
 
+3. (Optional) Apply the gateway admission receipt patch to the Hermes checkout:
+
+```bash
+git -C ~/.hermes/hermes-agent apply patches/hermes-bf0203a-admission-receipts.patch
+```
+
 4. Restart the gateway:
 
 ```bash
 hermes -p default gateway restart
 ```
+
+### Updating Hermes and the optional `run_busy.py` patch
+
+- **Profile plugins survive `hermes update`.** `hermes update` updates `~/.hermes/hermes-agent/` and does not modify `~/.hermes/profiles/<profile>/plugins/platforms/bluebubbles/` or profile `config.yaml` files. When `platforms/bluebubbles` is listed in `plugins.enabled`, Hermes loads the profile plugin instead of the bundled copy.
+- **When `patches/hermes-bf0203a-admission-receipts.patch` is needed.** Upstream Hermes already sets `event._gateway_accepted = True` for normal turns (`gateway/platforms/base.py`) and queued busy turns (`gateway/run_busy.py`), and `BlueBubblesAdapter` sets it for inline slash commands and text debounce. The optional patch to `gateway/run_busy.py` only covers mid-turn live steering (`steer` / `interrupt`) and plain-text `"yes"` / `"no"` tool approvals so a subsequent `updated-message` webhook for the same message is not steered or approved a second time.
+- If the patch is applied to `~/.hermes/hermes-agent/gateway/run_busy.py`, revert it before running `hermes update` (`git -C ~/.hermes/hermes-agent checkout -- gateway/run_busy.py`) and re-apply afterward if needed.
 
 ## Configuration
 
