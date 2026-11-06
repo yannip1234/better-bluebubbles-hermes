@@ -37,10 +37,21 @@ with _profile_runtime_scope(profile, hydrate_secrets=False):
     record = manager._plugins['platforms/bluebubbles']
     from tools.registry import registry
     if os.environ['EXPECT_ENABLED'] == 'yes':
-        assert registry.get_entry('bluebubbles_tapback') is not None
-        assert 'bluebubbles_tapback' in record.tools_registered
+        expected_tools = {
+            'bluebubbles_tapback',
+            'bluebubbles_remove_tapback',
+            'bluebubbles_edit_message',
+            'bluebubbles_unsend_message',
+            'bluebubbles_send_effect',
+            'bluebubbles_chat_action',
+            'bluebubbles_lookup',
+        }
         from toolsets import resolve_toolset
-        assert 'bluebubbles_tapback' in resolve_toolset('bluebubbles')
+        resolved = set(resolve_toolset('bluebubbles'))
+        for tname in expected_tools:
+            assert registry.get_entry(tname) is not None, tname
+            assert tname in record.tools_registered, tname
+            assert tname in resolved, tname
     assert pathlib.Path(record.manifest.path) == target
     runner = SimpleNamespace(config=SimpleNamespace(group_sessions_per_user=False),
         _instantiate_adapter=lambda p,c: GatewayAdapterLifecycleMixin._instantiate_adapter(runner,p,c))
@@ -57,8 +68,9 @@ with _profile_runtime_scope(profile, hydrate_secrets=False):
         manager._register_deferred_platform(record.manifest)
         deferred = manager._plugins['platforms/bluebubbles']
         assert deferred.deferred, deferred
-        assert 'bluebubbles_tapback' in deferred.tools_registered
-        assert registry.get_entry('bluebubbles_tapback') is not None
+        for tname in expected_tools:
+            assert tname in deferred.tools_registered, tname
+            assert registry.get_entry(tname) is not None, tname
     else:
         assert not record.enabled and 'not enabled in config' in record.error, record
         assert adapter is None

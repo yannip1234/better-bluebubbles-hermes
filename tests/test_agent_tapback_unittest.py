@@ -10,7 +10,15 @@ from gateway import session_context as sc
 from gateway.config import PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from plugin.adapter import BlueBubblesAdapter
-from plugin.tools import tapback
+from plugin.tools import (
+    chat_action,
+    edit_message,
+    lookup,
+    remove_tapback,
+    send_effect,
+    tapback,
+    unsend_message,
+)
 
 
 class ToolRuntimeTest(unittest.TestCase):
@@ -89,3 +97,144 @@ class ToolRuntimeTest(unittest.TestCase):
         with patch.object(BasePlatformAdapter, "_process_message_background", parent):
             asyncio.run(adapter._process_message_background(event, "key"))
         self.assertEqual(seen, ["new"])
+
+    def test_private_api_tools_and_adapter_methods(self):
+        adapter = BlueBubblesAdapter(PlatformConfig(extra={"server_url": "http://example.invalid", "password": "fake"}))
+        adapter.client = object()
+        adapter._private_api_enabled = adapter._helper_connected = True
+        adapter._resolve_chat_guid = AsyncMock(return_value="iMessage;+;group-1")
+        adapter._post_message = AsyncMock(return_value=SendResult(success=True, message_id="msg-sent-1"))
+        adapter._api_put = AsyncMock(return_value={"status": 200, "data": {"displayName": "New Group"}})
+        adapter._api_post = AsyncMock(return_value={"status": 200, "data": [{"handle": "+16179431941"}]})
+        adapter._api_delete = AsyncMock(return_value={"status": 200})
+        adapter._api_get = AsyncMock(
+            side_effect=lambda path: (
+                {"status": 200, "data": {"status": "silenced"}}
+                if path.endswith("/focus")
+                else {"status": 200, "data": {"available": True}}
+                if "/availability/" in path
+                else {"status": 200, "data": [{"name": "iPhone"}]}
+            )
+        )
+        adapter._private_api_chat_call = AsyncMock(return_value=True)
+        runner = SimpleNamespace(_gateway_loop=object())
+
+        async def dispatch(runner, make_coro, log):
+            return await make_coro()
+
+        with patch("tools.send_message_senders._live_adapter", return_value=(runner, adapter)), \
+             patch("tools.send_message_tool._dispatch_on_gateway_loop", dispatch):
+            sc.reset_session_vars()
+            self.assertFalse(json.loads(edit_message({"text": "updated"}))["success"])
+
+            tokens = sc.set_session_vars(
+                platform="bluebubbles",
+                chat_id="iMessage;+;group-1",
+                message_id="inbound-msg-1",
+                user_id="alice",
+                session_key="key",
+            )
+            try:
+                # 1. Tapback + remove_tapback
+                self.assertTrue(json.loads(tapback({"reaction": "love"}))["success"])
+                self.assertTrue(json.loads(remove_tapback({}))["success"])
+                self.assertEqual(
+                    adapter._post_message.await_args_list[-1].args,
+                    (
+                        "/api/v1/message/react",
+                        {
+                            "chatGuid": "iMessage;+;group-1",
+                            "selectedMessageGuid": "inbound-msg-1",
+                            "reaction": "-love",
+                            "partIndex": 0,
+                        },
+                    ),
+                )
+
+                # 2. Send with effect + subject -> records last sent message_id
+                res_effect = json.loads(
+                    send_effect(
+                        {
+                            "text": "Happy Birthday!",
+                            "effect": "confetti",
+                            "subject": "Party Time",
+                            "reply_to_current": True,
+                        }
+                    )
+                )
+                self.assertTrue(res_effect["success"])
+                self.assertEqual(res_effect["effect_id"], "com.apple.messages.effect.CKConfettiEffect")
+                effect_call = adapter._post_message.await_args_list[-1]
+                self.assertEqual(effect_call.args[0], "/api/v1/message/text")
+                self.assertEqual(effect_call.args[1]["effectId"], "com.apple.messages.effect.CKConfettiEffect")
+                self.assertEqual(effect_call.args[1]["subject"], "Party Time")
+                self.assertEqual(effect_call.args[1]["selectedMessageGuid"], "inbound-msg-1")
+
+                # 3. Edit last sent message
+                res_edit = json.loads(edit_message({"text": "Happy Birthday!!"}))
+                self.assertTrue(res_edit["success"])
+                self.assertEqual(
+                    adapter._post_message.await_args_list[-1].args,
+                    (
+                        "/api/v1/message/msg-sent-1/edit",
+                        {
+                            "editedMessage": "Happy Birthday!!",
+                            "backwardsCompatibilityMessage": 'Edited to "Happy Birthday!!"',
+                            "partIndex": 0,
+                        },
+                    ),
+                )
+
+                # 4. Notify anyway on last sent message
+                res_notify = json.loads(chat_action({"action": "notify_anyway"}))
+                self.assertTrue(res_notify["success"])
+                self.assertEqual(
+                    adapter._post_message.await_args_list[-1].args,
+                    ("/api/v1/message/msg-sent-1/notify", {}),
+                )
+
+                # 5. Unsend last sent message
+                res_unsend = json.loads(unsend_message({}))
+                self.assertTrue(res_unsend["success"])
+                self.assertEqual(
+                    adapter._post_message.await_args_list[-1].args,
+                    ("/api/v1/message/msg-sent-1/unsend", {"partIndex": 0}),
+                )
+
+                # 6. Group chat management & mark_unread
+                self.assertTrue(json.loads(chat_action({"action": "mark_unread"}))["success"])
+                self.assertTrue(
+                    json.loads(chat_action({"action": "rename_group", "display_name": "New Group"}))["success"]
+                )
+                self.assertTrue(
+                    json.loads(
+                        chat_action({"action": "add_participant", "address": "+16179431941"})
+                    )["success"]
+                )
+                self.assertTrue(
+                    json.loads(
+                        chat_action({"action": "remove_participant", "address": "+16179431941"})
+                    )["success"]
+                )
+                self.assertTrue(json.loads(chat_action({"action": "remove_group_icon"}))["success"])
+                self.assertTrue(json.loads(chat_action({"action": "leave_group"}))["success"])
+
+                # 7. Lookups: focus_status, availability, FindMy
+                res_focus = json.loads(lookup({"query": "focus_status", "address": "+16179431941"}))
+                self.assertTrue(res_focus["success"])
+                self.assertEqual(res_focus["status"], "silenced")
+
+                res_imsg = json.loads(lookup({"query": "imessage_availability", "address": "+16179431941"}))
+                self.assertTrue(res_imsg["success"])
+                self.assertTrue(res_imsg["available"])
+
+                res_ft = json.loads(lookup({"query": "facetime_availability", "address": "+16179431941"}))
+                self.assertTrue(res_ft["success"])
+                self.assertTrue(res_ft["available"])
+
+                res_friends = json.loads(lookup({"query": "findmy_friends", "refresh": True}))
+                self.assertTrue(res_friends["success"])
+                res_devices = json.loads(lookup({"query": "findmy_devices"}))
+                self.assertTrue(res_devices["success"])
+            finally:
+                sc.clear_session_vars(tokens)

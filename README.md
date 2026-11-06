@@ -5,8 +5,22 @@ BlueBubbles iMessage platform plugin (`bluebubbles-platform`) for Hermes Agent. 
 ## Features
 
 - **Multi-profile DM and group routing.** Differentiates direct message chat GUIDs (`;-;`) from group chat GUIDs (`;+;`) so multiple Hermes profiles can share one BlueBubbles server and only accept or reply to their designated chats.
-- **Webhook hydration and late media.** Merges sparse `new-message` and `updated-message` webhook deliveries by message GUID, hydrates missing chat or attachment metadata from `/api/v1/message/<guid>?with=chats,attachments`, and retries pending attachments for up to five minutes without replaying admitted text.
-- **Tapback reactions.** Provides `add_reaction`, `remove_reaction`, and the `bluebubbles_tapback` agent tool for the six native iMessage tapbacks (`love`, `like`, `dislike`, `laugh`, `emphasize`, `question`) through the BlueBubbles Private API.
+- **Webhook hydration, late media, and inbound edits/unsends.** Merges sparse `new-message` and `updated-message` webhook deliveries by message GUID, hydrates missing chat or attachment metadata from `/api/v1/message/<guid>?with=chats,attachments`, forces Private API downloads for offloaded iCloud attachments, retries pending attachments for up to five minutes without replaying admitted text, and delivers user message edits (`dateEdited`) and unsends (`dateRetracted`) with distinct revision keys.
+- **Full BlueBubbles Private API support & agent tools.** Supports Tapback reactions (add & remove), editing and unsending sent messages, iMessage bubble & screen effects, bold subject lines, attachment reply threading, read/unread state, "Notify Anyway" on silenced chats, group chat management (rename, add/remove participants, set/remove group icon, leave group), recipient Focus/DND & iMessage/FaceTime availability checks, and FindMy Friends & Devices lookups.
+
+## Agent Tools (`bluebubbles` toolset)
+
+All chat-mutating tools authenticate against the active BlueBubbles turn context (`gateway.session_context`) and enforce the profile's DM/group routing boundaries:
+
+| Tool | Description |
+| --- | --- |
+| `bluebubbles_tapback` | Add one of the six native iMessage Tapbacks (`love`, `like`, `dislike`, `laugh`, `emphasize`, `question`) to the current incoming message |
+| `bluebubbles_remove_tapback` | Remove a previously sent Tapback from the current incoming message (or a specified `message_id` in the current chat) |
+| `bluebubbles_edit_message` | Edit a previously sent bot message in the current chat (`text` required; `message_id` defaults to `"last"`) |
+| `bluebubbles_unsend_message` | Unsend (retract) a previously sent bot message in the current chat (`message_id` defaults to `"last"`) |
+| `bluebubbles_send_effect` | Send an iMessage with a bubble effect (`slam`, `loud`, `gentle`, `invisible`), full-screen effect (`balloons`, `confetti`, `lasers`, `fireworks`, `shooting-star`, `celebration`, `love`, `echo`, `spotlight`), and/or bold `subject` line |
+| `bluebubbles_chat_action` | Run a Private API chat action on the current chat: `mark_read`, `mark_unread`, `notify_anyway`, `rename_group`, `add_participant`, `remove_participant`, `set_group_icon`, `remove_group_icon`, or `leave_group` |
+| `bluebubbles_lookup` | Query recipient Focus/DND status (`focus_status`), service availability (`imessage_availability`, `facetime_availability`), or FindMy locations (`findmy_friends`, `findmy_devices` with optional `refresh: true`) |
 
 ## Installation
 

@@ -754,6 +754,7 @@ class TestBlueBubblesAdmissionBoundaries:
 
 class TestBlueBubblesProfileRouting:
     _payload = staticmethod(TestBlueBubblesInboundRegression._payload)
+    _capture = staticmethod(TestBlueBubblesInboundRegression._capture)
 
     @staticmethod
     def _build_profile_adapter(monkeypatch, config_dict):
@@ -913,3 +914,91 @@ class TestBlueBubblesProfileRouting:
             assert await adapter._resolve_chat_guid(f";+;{group_id}") == f"any;+;{group_id}"
             adapter._remember_chat_guid(f"iMessage;+;{group_id}", f"iMessage;+;{group_id}")
             assert await adapter._resolve_chat_guid(f";+;{group_id}") == f"iMessage;+;{group_id}"
+
+    @pytest.mark.asyncio
+    async def test_inbound_message_edit_and_unsend_events_delivered(self, monkeypatch):
+        adapter, handled = self._capture(monkeypatch)
+        dm = {"guid": "iMessage;-;+15551230100", "style": 45, "chatIdentifier": "+15551230100"}
+
+        # Initial message
+        r1 = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(self._payload("new-message", guid="edit-msg-1", chat=dm, text="typo text"))
+        )
+        assert r1.status == 200
+        assert len(handled) == 1
+        assert handled[0].text == "typo text"
+        assert handled[0].edit_revision is None
+
+        # User edits the message
+        r2 = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                self._payload(
+                    "updated-message",
+                    guid="edit-msg-1",
+                    chat=dm,
+                    text="corrected text",
+                    dateEdited=1700000001000,
+                )
+            )
+        )
+        assert r2.status == 200
+        assert len(handled) == 2
+        assert handled[1].text == "[Edited message] corrected text"
+        assert handled[1].edit_revision == "edit:1700000001000"
+
+        # Duplicate webhook with same dateEdited is ignored
+        r3 = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                self._payload(
+                    "updated-message",
+                    guid="edit-msg-1",
+                    chat=dm,
+                    text="corrected text",
+                    dateEdited=1700000001000,
+                )
+            )
+        )
+        assert r3.status == 200
+        assert len(handled) == 2
+
+        # User unsends the message
+        r4 = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                self._payload(
+                    "updated-message",
+                    guid="edit-msg-1",
+                    chat=dm,
+                    text="",
+                    dateRetracted=1700000005000,
+                )
+            )
+        )
+        assert r4.status == 200
+        assert len(handled) == 3
+        assert handled[2].text.startswith("[Unsent message")
+        assert handled[2].edit_revision == "unsend:1700000005000"
+
+    @pytest.mark.asyncio
+    async def test_pending_attachment_triggers_private_api_force_download(self, monkeypatch):
+        adapter, _handled = self._capture(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter._private_api_enabled = True
+        adapter._helper_connected = True
+        forced = []
+
+        async def fake_force(guid):
+            forced.append(guid)
+            return True
+
+        monkeypatch.setattr(adapter, "_force_download_attachment", fake_force)
+        state = adapter._get_inbound_message("msg-att-force", {})
+        await adapter._collect_attachments(
+            {"attachments": [{"guid": "att-offloaded-1", "transferState": 0, "mimeType": "image/jpeg"}]},
+            state=state,
+        )
+        # Second pass should not re-trigger force download for the same attachment GUID
+        await adapter._collect_attachments(
+            {"attachments": [{"guid": "att-offloaded-1", "transferState": 0, "mimeType": "image/jpeg"}]},
+            state=state,
+        )
+        assert forced == ["att-offloaded-1"]

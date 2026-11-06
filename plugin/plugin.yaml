@@ -3,6 +3,12 @@ label: BlueBubbles (iMessage)
 kind: platform
 provides_tools:
   - bluebubbles_tapback
+  - bluebubbles_remove_tapback
+  - bluebubbles_edit_message
+  - bluebubbles_unsend_message
+  - bluebubbles_send_effect
+  - bluebubbles_chat_action
+  - bluebubbles_lookup
 version: 1.0.0
 description: >
   BlueBubbles (Apple iMessage) gateway adapter for Hermes Agent.

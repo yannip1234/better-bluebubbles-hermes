@@ -80,6 +80,9 @@ class _InboundMessage:
     retry_payload: Any = None
     delivered: set[str] = field(default_factory=set)
     downloaded: dict[str, tuple[str, str]] = field(default_factory=dict)
+    force_requested: set[str] = field(default_factory=set)
+    last_edit_ts: int = 0
+    retracted: bool = False
 
 
 def _ok():
@@ -161,6 +164,16 @@ class BlueBubblesInboundMixin:
             if not att_guid or (state is not None and att_guid in state.delivered):
                 continue
             if att.get("transferState") not in (None, 5, "5"):
+                if (getattr(self, "_private_api_enabled", False)
+                        and getattr(self, "_helper_connected", False)
+                        and getattr(self, "client", None) is not None
+                        and (state is None or att_guid not in state.force_requested)):
+                    if state is not None:
+                        state.force_requested.add(att_guid)
+                    force_fn = getattr(self, "_force_download_attachment", None)
+                    if callable(force_fn):
+                        with suppress(Exception):
+                            await force_fn(att_guid)
                 continue
             mime = (att.get("mimeType") or "").lower()
             prior = state.downloaded.get(att_guid) if state is not None else None
@@ -270,8 +283,36 @@ class BlueBubblesInboundMixin:
         return bool(chat_guid and (";-;" in chat_guid or ";+;" in chat_guid))
 
     @staticmethod
-    def _is_receipt_only_update(event_type: str, record: dict[str, Any]) -> bool:
+    def _extract_retracted_ts(record: dict[str, Any]) -> int:
+        raw = record.get("dateRetracted")
+        with suppress(TypeError, ValueError):
+            if raw is not None and int(raw) > 0:
+                return int(raw)
+        return 1 if record.get("isRetracted") else 0
+
+    @staticmethod
+    def _extract_edited_ts(record: dict[str, Any]) -> int:
+        raw = record.get("dateEdited")
+        with suppress(TypeError, ValueError):
+            if raw is not None and int(raw) > 0:
+                return int(raw)
+        return 0
+
+    @classmethod
+    def _has_pending_edit_or_unsend(cls, state: _InboundMessage, record: dict[str, Any]) -> bool:
+        if not state.accepted:
+            return False
+        retracted_ts = cls._extract_retracted_ts(record) or cls._extract_retracted_ts(state.record)
+        if retracted_ts > 0 and not state.retracted:
+            return True
+        edited_ts = cls._extract_edited_ts(record) or cls._extract_edited_ts(state.record)
+        return edited_ts > state.last_edit_ts
+
+    @classmethod
+    def _is_receipt_only_update(cls, event_type: str, record: dict[str, Any]) -> bool:
         # Receipt snapshots can also carry previously unseen content and completed attachments.
+        if cls._extract_retracted_ts(record) > 0 or cls._extract_edited_ts(record) > 0:
+            return False
         return (event_type == "updated-message"
                 and not any(record.get(key) for key in ("text", "message", "body", "attachments")))
 
@@ -351,7 +392,10 @@ class BlueBubblesInboundMixin:
                 current.record.clear()
                 current.record.update(merged)
                 current.accepted = current.accepted or held.accepted
+                current.retracted = current.retracted or held.retracted
+                current.last_edit_ts = max(current.last_edit_ts, held.last_edit_ts)
                 current.delivered.update(held.delivered)
+                current.force_requested.update(held.force_requested)
                 for guid, cached in held.downloaded.items():
                     current.downloaded.setdefault(guid, cached)
                 current.touched = max(current.touched, held.touched)
@@ -465,9 +509,14 @@ class BlueBubblesInboundMixin:
 
         _chat_guid, chat_id, chat_identifier, sender, is_group = route
         record = state.record
+        self._restore_admitted_content(state, message_id)
+        retracted_ts = self._extract_retracted_ts(record)
+        edited_ts = self._extract_edited_ts(record)
+        pending_unsend = state.accepted and retracted_ts > 0 and not state.retracted
+        pending_edit = state.accepted and not pending_unsend and edited_ts > state.last_edit_ts
         text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
         # Known unmentioned group text needs no media I/O; sparse text can still hydrate below.
-        if is_group and self.require_mention and text and not self._message_matches_mention_patterns(text):
+        if is_group and self.require_mention and not pending_unsend and text and not self._message_matches_mention_patterns(text):
             return _ok()
         if record.get("attachments") and not state.attachment_deadline:
             state.attachment_deadline = time.monotonic() + _ATTACHMENT_WAIT_SECONDS
@@ -480,10 +529,15 @@ class BlueBubblesInboundMixin:
                 logger.warning("[bluebubbles] attachment hydration failed: %s", type(exc).__name__)
         text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
         if is_group and self.require_mention:
-            if not self._message_matches_mention_patterns(text):
+            if not pending_unsend and not self._message_matches_mention_patterns(text):
                 return _ok()
-            text = self._clean_mention_text(text)
+            if text:
+                text = self._clean_mention_text(text)
         self._restore_admitted_content(state, message_id)
+        retracted_ts = self._extract_retracted_ts(record)
+        edited_ts = self._extract_edited_ts(record)
+        pending_unsend = state.accepted and retracted_ts > 0 and not state.retracted
+        pending_edit = state.accepted and not pending_unsend and edited_ts > state.last_edit_ts
         media_urls, media_types, msg_type, collected = await self._collect_attachments(record, state=state)
         attachments = {att.get("guid") for att in record.get("attachments") or []
                        if isinstance(att, dict) and att.get("guid")} - state.delivered
@@ -491,14 +545,26 @@ class BlueBubblesInboundMixin:
             if not state.attachment_deadline or time.monotonic() < state.attachment_deadline:
                 self._schedule_attachment_retry(payload, state, message_id)
                 return _ok()
-            if state.accepted:
+            if state.accepted and not (pending_unsend or pending_edit):
                 return web.json_response({"error": "attachments not ready"}, status=503)
             text = (text + "\n\n[An attachment was included, but could not be retrieved within five minutes.]").strip()
             attachments = collected
+        edit_revision: Optional[str] = None
         if state.accepted:
-            if not media_urls:
+            if pending_unsend:
+                text = f"[Unsent message: {text}]" if text else "[Unsent message]"
+                edit_revision = f"unsend:{retracted_ts}"
+            elif pending_edit:
+                if not text:
+                    return _ok()
+                text = f"[Edited message] {text}"
+                edit_revision = f"edit:{edited_ts}"
+            elif media_urls:
+                text = "(attachment)"
+                edit_revision = "attachments:" + hashlib.sha256(
+                    json.dumps(sorted(attachments)).encode()).hexdigest()
+            else:
                 return _ok()
-            text = "(attachment)"
         elif not text and media_urls:
             text = "(attachment)"
         if not text:
@@ -514,17 +580,20 @@ class BlueBubblesInboundMixin:
             raw_message={**payload, "data": deepcopy(record)}, message_id=message_id,
             reply_to_message_id=self._value(record.get("threadOriginatorGuid"), record.get("associatedMessageGuid")),
             media_urls=media_urls, media_types=media_types)
-        if state.accepted:
-            # Native admission keys by message GUID plus revision. New media is a new input,
+        if edit_revision:
+            # Native admission keys by message GUID plus revision. New media or edit/unsend is a new input,
             # while the original GUID must remain intact for provider replies and reactions.
-            event.edit_revision = "attachments:" + hashlib.sha256(
-                json.dumps(sorted(attachments)).encode()).hexdigest()
+            event.edit_revision = edit_revision
         try:
             await self.handle_message(event)
         finally:
             # Admission, not model/output completion, is the point of no replay.
             if event._gateway_accepted:
                 state.accepted = True
+                if retracted_ts > 0:
+                    state.retracted = True
+                if edited_ts > state.last_edit_ts:
+                    state.last_edit_ts = edited_ts
                 self._remember_admitted_content(message_id, attachments)
                 state.delivered.update(attachments)
                 for guid in attachments:
@@ -575,7 +644,8 @@ class BlueBubblesInboundMixin:
             async with state.lock:
                 attachments = {att.get("guid") for att in state.record.get("attachments") or []
                                if isinstance(att, dict) and att.get("guid")}
-                if state.accepted and attachments <= state.delivered:
+                if (state.accepted and attachments <= state.delivered
+                        and not self._has_pending_edit_or_unsend(state, record)):
                     return _ok()
                 # Resolve sparse routes in order; attachment work runs outside the routing lock.
                 async with self._inbound_routing_lock:

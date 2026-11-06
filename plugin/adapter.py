@@ -74,6 +74,47 @@ _ADDRESS_RE = re.compile(r"^\+\d+")
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
 _LOCAL_HOSTS = {"0.0.0.0", "127.0.0.1", "localhost", "::"}
 
+# Apple iMessage bubble and full-screen effect identifiers (Private API).
+EFFECT_MAP: dict[str, str] = {
+    # Bubble effects
+    "slam": "com.apple.MobileSMS.expressivesend.impact",
+    "impact": "com.apple.MobileSMS.expressivesend.impact",
+    "loud": "com.apple.MobileSMS.expressivesend.loud",
+    "gentle": "com.apple.MobileSMS.expressivesend.gentle",
+    "invisible": "com.apple.MobileSMS.expressivesend.invisibleink",
+    "invisible-ink": "com.apple.MobileSMS.expressivesend.invisibleink",
+    "invisible_ink": "com.apple.MobileSMS.expressivesend.invisibleink",
+    "invisibleink": "com.apple.MobileSMS.expressivesend.invisibleink",
+    # Screen effects
+    "balloons": "com.apple.messages.effect.CKHappyBirthdayEffect",
+    "birthday": "com.apple.messages.effect.CKHappyBirthdayEffect",
+    "confetti": "com.apple.messages.effect.CKConfettiEffect",
+    "lasers": "com.apple.messages.effect.CKLasersEffect",
+    "fireworks": "com.apple.messages.effect.CKFireworksEffect",
+    "shooting-star": "com.apple.messages.effect.CKShootingStarEffect",
+    "shooting_star": "com.apple.messages.effect.CKShootingStarEffect",
+    "shootingstar": "com.apple.messages.effect.CKShootingStarEffect",
+    "celebration": "com.apple.messages.effect.CKSparklesEffect",
+    "sparkles": "com.apple.messages.effect.CKSparklesEffect",
+    "love": "com.apple.messages.effect.CKHeartEffect",
+    "heart": "com.apple.messages.effect.CKHeartEffect",
+    "echo": "com.apple.messages.effect.CKEchoEffect",
+    "spotlight": "com.apple.messages.effect.CKSpotlightEffect",
+}
+_VALID_EFFECT_IDS = set(EFFECT_MAP.values())
+
+
+def _resolve_effect_id(raw: Optional[str]) -> Optional[str]:
+    """Resolve a short effect alias (e.g. ``slam``, ``confetti``) or full Apple effect ID."""
+    if not raw or not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    if cleaned in _VALID_EFFECT_IDS:
+        return cleaned
+    return EFFECT_MAP.get(cleaned.lower())
+
 
 def _redact(text: str) -> str:
     """Redact phone numbers and emails from log output."""
@@ -249,6 +290,8 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         self._inbound_routing_lock = asyncio.Lock()
         self._inbound_chat_tails = {}
         self._sent_tapbacks: OrderedDict[tuple[str, str], str] = OrderedDict()
+        self._sent_messages: OrderedDict[tuple[str, str], str] = OrderedDict()
+        self._last_sent_by_chat: OrderedDict[str, str] = OrderedDict()
         # The runner carries this shared cache across adapter rebuilds. Store only accepted content.
         self._dedup = MessageDeduplicator(max_size=2000, ttl_seconds=48 * 3600)
 
@@ -301,8 +344,43 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
     async def _api_get(self, path: str) -> dict[str, Any]:
         return await self._api_json("get", path)
 
-    async def _api_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _api_post(self, path: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        if payload is None:
+            return await self._api_json("post", path)
         return await self._api_json("post", path, json=payload)
+
+    async def _api_put(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._api_json("put", path, json=payload)
+
+    async def _api_delete(self, path: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        if payload is None:
+            return await self._api_json("delete", path)
+        return await self._api_json("delete", path, json=payload)
+
+    def _remember_sent_message(self, chat_id: str, guid: str, message_id: Optional[str]) -> None:
+        if not message_id or message_id == "ok":
+            return
+        for key in (chat_id, guid, _canonical_chat_guid_key(guid), _canonical_chat_guid_key(chat_id)):
+            if not key:
+                continue
+            self._last_sent_by_chat[key] = message_id
+            self._last_sent_by_chat.move_to_end(key)
+            pair = (key, message_id)
+            self._sent_messages[pair] = guid
+            self._sent_messages.move_to_end(pair)
+        while len(self._last_sent_by_chat) > _GUID_CACHE_SIZE:
+            self._last_sent_by_chat.popitem(last=False)
+        while len(self._sent_messages) > 2000:
+            self._sent_messages.popitem(last=False)
+
+    def _resolve_sent_message_id(self, chat_id: str, guid: str, message_id: Optional[str] = None) -> Optional[str]:
+        cleaned = (message_id or "").strip()
+        if cleaned and cleaned.lower() != "last":
+            return cleaned
+        for key in (chat_id, guid, _canonical_chat_guid_key(guid), _canonical_chat_guid_key(chat_id)):
+            if key and key in self._last_sent_by_chat:
+                return self._last_sent_by_chat[key]
+        return None
 
     async def _post_message(self, path: str, payload: dict[str, Any]) -> SendResult:
         """POST a message payload and wrap the outcome as a SendResult."""
@@ -661,7 +739,11 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
         text = self.format_message(content)
-        if not text:
+        meta = metadata if isinstance(metadata, dict) else {}
+        subject = str(meta.get("subject") or "").strip() or None
+        raw_effect = meta.get("effect") or meta.get("effect_id") or meta.get("effectId")
+        effect_id = _resolve_effect_id(str(raw_effect)) if raw_effect else None
+        if not text and not (subject and self._private_api_enabled and self._helper_connected):
             return SendResult(success=False, error="BlueBubbles send requires text")
         if not self._is_target_allowed(chat_id):
             return SendResult(success=False, error=f"BlueBubbles chat not allowed for this profile: {chat_id}")
@@ -670,22 +752,147 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         chunks = [c for para in paragraphs for c in (
             [para] if len(para) <= self.MAX_MESSAGE_LENGTH else self.truncate_message(para, self.MAX_MESSAGE_LENGTH))]
         last = SendResult(success=True)
-        for chunk in chunks:
+        for idx, chunk in enumerate(chunks):
             guid = await self._resolve_chat_guid(chat_id)
             if not guid:
                 if (self._private_api_enabled and not self.ignore_direct_messages
                         and ";" not in (chat_id or "")
                         and ("@" in chat_id or _ADDRESS_RE.match(chat_id))):  # address → new chat
-                    return await self._create_chat_for_handle(chat_id, chunk)
+                    created = await self._create_chat_for_handle(chat_id, chunk)
+                    if created.success:
+                        self._remember_sent_message(chat_id, f"any{_DM_DELIMITER}{chat_id}", created.message_id)
+                    return created
                 return SendResult(success=False, error=f"BlueBubbles chat not found for target: {chat_id}")
             if not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
                 return SendResult(success=False, error=f"BlueBubbles chat not allowed for this profile: {guid}")
             payload: dict[str, Any] = {"chatGuid": guid, "tempGuid": _temp_guid(), "message": chunk}
-            if reply_to and self._private_api_enabled and self._helper_connected:
-                payload.update(method="private-api", selectedMessageGuid=reply_to, partIndex=0)
+            if self._private_api_enabled and self._helper_connected:
+                if reply_to and idx == 0:
+                    payload.update(method="private-api", selectedMessageGuid=reply_to, partIndex=0)
+                if subject and idx == 0:
+                    payload.update(method="private-api", subject=subject)
+                if effect_id and idx == len(chunks) - 1:
+                    payload.update(method="private-api", effectId=effect_id)
             if not (last := await self._post_message("/api/v1/message/text", payload)).success:
                 return last
+            self._remember_sent_message(chat_id, guid, last.message_id)
         return last
+
+    async def send_effect(self, chat_id: str, content: str = "", *, effect: Optional[str] = None,
+                          subject: Optional[str] = None, reply_to: Optional[str] = None) -> dict[str, Any]:
+        """Send an iMessage with a bubble/screen effect and/or bold subject line via Private API."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        effect_id: Optional[str] = None
+        if effect is not None and str(effect).strip():
+            effect_id = _resolve_effect_id(str(effect))
+            if not effect_id:
+                return {"success": False, "error": f"Unsupported iMessage effect: {effect}"}
+        cleaned_subject = (subject or "").strip() or None
+        text = self.format_message(content or "")
+        if not text and not cleaned_subject:
+            return {"success": False, "error": "Message text or subject is required"}
+        if not effect_id and not cleaned_subject:
+            return {"success": False, "error": "Specify an effect and/or subject"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+        payload: dict[str, Any] = {
+            "chatGuid": guid,
+            "tempGuid": _temp_guid(),
+            "message": text,
+            "method": "private-api",
+        }
+        if effect_id:
+            payload["effectId"] = effect_id
+        if cleaned_subject:
+            payload["subject"] = cleaned_subject
+        if reply_to:
+            payload["selectedMessageGuid"] = reply_to
+            payload["partIndex"] = 0
+        res = await self._post_message("/api/v1/message/text", payload)
+        if not res.success:
+            return {"success": False, "error": res.error}
+        self._remember_sent_message(chat_id, guid, res.message_id)
+        return {"success": True, "message_id": res.message_id, "effect_id": effect_id, "subject": cleaned_subject}
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str, *,
+                           finalize: bool = False, part_index: int = 0) -> SendResult:
+        """Edit a previously sent iMessage via the BlueBubbles Private API."""
+        text = self.format_message(content)
+        if not text:
+            return SendResult(success=False, error="Edited message text cannot be empty")
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return SendResult(success=False, error="BlueBubbles Private API helper is unavailable")
+        if not self._is_target_allowed(chat_id):
+            return SendResult(success=False, error="Chat not allowed for this profile")
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return SendResult(success=False, error="Chat not found")
+        target_id = self._resolve_sent_message_id(chat_id, guid, message_id)
+        if not target_id:
+            return SendResult(success=False, error="No sent message GUID available to edit in this chat")
+        res = await self._post_message(
+            f"/api/v1/message/{quote(target_id, safe='')}/edit",
+            {
+                "editedMessage": text,
+                "backwardsCompatibilityMessage": f'Edited to "{text}"',
+                "partIndex": max(0, int(part_index)),
+            },
+        )
+        if res.success and (not res.message_id or res.message_id == "ok"):
+            res.message_id = target_id
+        return res
+
+    async def unsend_message(self, chat_id: str, message_id: Optional[str] = None, *,
+                             part_index: int = 0) -> SendResult:
+        """Unsend (retract) a previously sent iMessage via the BlueBubbles Private API."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return SendResult(success=False, error="BlueBubbles Private API helper is unavailable")
+        if not self._is_target_allowed(chat_id):
+            return SendResult(success=False, error="Chat not allowed for this profile")
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return SendResult(success=False, error="Chat not found")
+        target_id = self._resolve_sent_message_id(chat_id, guid, message_id)
+        if not target_id:
+            return SendResult(success=False, error="No sent message GUID available to unsend in this chat")
+        res = await self._post_message(
+            f"/api/v1/message/{quote(target_id, safe='')}/unsend",
+            {"partIndex": max(0, int(part_index))},
+        )
+        if res.success:
+            for key in (chat_id, guid, _canonical_chat_guid_key(guid), _canonical_chat_guid_key(chat_id)):
+                if key and self._last_sent_by_chat.get(key) == target_id:
+                    self._last_sent_by_chat.pop(key, None)
+                if key:
+                    self._sent_messages.pop((key, target_id), None)
+            if not res.message_id or res.message_id == "ok":
+                res.message_id = target_id
+        return res
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Gateway delete_message interface mapped to BlueBubbles Private API unsend."""
+        return (await self.unsend_message(chat_id, message_id)).success
+
+    async def notify_anyway(self, chat_id: str, message_id: Optional[str] = None) -> dict[str, Any]:
+        """Trigger 'Notify Anyway' on a silenced message via the BlueBubbles Private API."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+        target_id = self._resolve_sent_message_id(chat_id, guid, message_id)
+        if not target_id:
+            return {"success": False, "error": "A message GUID is required"}
+        res = await self._post_message(f"/api/v1/message/{quote(target_id, safe='')}/notify", {})
+        if not res.success:
+            return {"success": False, "error": res.error}
+        return {"success": True, "message_id": res.message_id if res.message_id != "ok" else target_id}
 
     async def add_reaction(self, chat_id: str, emoji: str, message_id: Optional[str] = None) -> dict[str, Any]:
         """Send one of the six native tapbacks using the gateway reaction interface."""
@@ -738,7 +945,9 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
     # --- Media sending (outbound) ---
 
     async def _send_attachment(self, chat_id: str, file_path: str, filename: Optional[str] = None,
-                               caption: Optional[str] = None, is_audio_message: bool = False) -> SendResult:
+                               caption: Optional[str] = None, is_audio_message: bool = False,
+                               reply_to: Optional[str] = None, effect: Optional[str] = None,
+                               subject: Optional[str] = None) -> SendResult:
         """Send a file attachment via BlueBubbles multipart upload."""
         if not self.client:
             return SendResult(success=False, error="Not connected")
@@ -757,16 +966,28 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             data: dict[str, str] = {"chatGuid": guid, "name": fname, "tempGuid": uuid.uuid4().hex}
             if is_audio_message:
                 data["isAudioMessage"] = "true"
+            if self._private_api_enabled and self._helper_connected:
+                if reply_to:
+                    data["method"] = "private-api"
+                    data["selectedMessageGuid"] = reply_to
+                    data["partIndex"] = "0"
+                if effect and (effect_id := _resolve_effect_id(effect)):
+                    data["method"] = "private-api"
+                    data["effectId"] = effect_id
+                if subject and subject.strip():
+                    data["method"] = "private-api"
+                    data["subject"] = subject.strip()
             res = await self.client.post(self._api_url("/api/v1/message/attachment"), data=data, timeout=120,
                                          files={"attachment": (fname, payload, "application/octet-stream")})
             res.raise_for_status()
             result = res.json()
             if caption:
-                await self.send(chat_id, caption)
+                await self.send(chat_id, caption, reply_to=reply_to)
             if result.get("status") == 200:
                 rdata = result.get("data") or {}
-                return SendResult(success=True, message_id=rdata.get("guid") if isinstance(rdata, dict) else None,
-                                  raw_response=result)
+                msg_id = rdata.get("guid") if isinstance(rdata, dict) else None
+                self._remember_sent_message(chat_id, guid, msg_id)
+                return SendResult(success=True, message_id=msg_id, raw_response=result)
             return SendResult(success=False, error=result.get("message", "Attachment upload failed"))
         except Exception as e:
             return SendResult(success=False, error=str(e))
@@ -775,28 +996,39 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                          reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         try:
             from gateway.platforms.base import cache_image_from_url
-            return await self._send_attachment(chat_id, await cache_image_from_url(image_url), caption=caption)
+            meta = metadata if isinstance(metadata, dict) else {}
+            return await self._send_attachment(
+                chat_id, await cache_image_from_url(image_url), caption=caption, reply_to=reply_to,
+                effect=meta.get("effect") or meta.get("effect_id"), subject=meta.get("subject"))
         except Exception:
             return await super().send_image(chat_id, image_url, caption, reply_to)
 
     async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None, **kw) -> SendResult:
-        return await self._send_attachment(chat_id, image_path, caption=caption)
+        return await self._send_attachment(
+            chat_id, image_path, caption=caption, reply_to=reply_to,
+            effect=kw.get("effect"), subject=kw.get("subject"))
 
     async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None, is_voice=None, **kw) -> SendResult:
         # is_voice=False is a plain audio MEDIA file (music, a sound effect): a normal attachment,
         # never an iMessage voice memo.
-        return await self._send_attachment(chat_id, audio_path, caption=caption, is_audio_message=is_voice is not False)
+        return await self._send_attachment(
+            chat_id, audio_path, caption=caption, is_audio_message=is_voice is not False,
+            reply_to=reply_to, effect=kw.get("effect"), subject=kw.get("subject"))
 
     async def send_video(self, chat_id, video_path, caption=None, reply_to=None, **kw) -> SendResult:
-        return await self._send_attachment(chat_id, video_path, caption=caption)
+        return await self._send_attachment(
+            chat_id, video_path, caption=caption, reply_to=reply_to,
+            effect=kw.get("effect"), subject=kw.get("subject"))
 
     async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, **kw) -> SendResult:
-        return await self._send_attachment(chat_id, file_path, filename=file_name, caption=caption)
+        return await self._send_attachment(
+            chat_id, file_path, filename=file_name, caption=caption, reply_to=reply_to,
+            effect=kw.get("effect"), subject=kw.get("subject"))
 
     async def send_animation(self, chat_id, animation_url, caption=None, reply_to=None, metadata=None) -> SendResult:
         return await self.send_image(chat_id, animation_url, caption, reply_to, metadata)
 
-    # --- Typing indicators / read receipts (private API only) ---
+    # --- Typing indicators / read receipts / chat actions (private API only) ---
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         await self._private_api_chat_call(chat_id, "typing", "post")
@@ -806,6 +1038,184 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
 
     async def mark_read(self, chat_id: str) -> bool:
         return await self._private_api_chat_call(chat_id, "read", "post")
+
+    async def mark_unread(self, chat_id: str) -> bool:
+        return await self._private_api_chat_call(chat_id, "unread", "post")
+
+    async def rename_group(self, chat_id: str, display_name: str) -> dict[str, Any]:
+        """Set or update the display name of a group chat via the BlueBubbles Private API."""
+        name = (display_name or "").strip()
+        if not name:
+            return {"success": False, "error": "A non-empty group display_name is required"}
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+        if not _is_group_chat_guid(guid):
+            return {"success": False, "error": "Cannot rename a direct message chat; group chat (;+;) required"}
+        try:
+            res = await self._api_put(f"/api/v1/chat/{quote(guid, safe='')}", {"displayName": name})
+            return {"success": True, "chat_guid": guid, "display_name": name, "data": res.get("data")}
+        except Exception as exc:
+            return {"success": False, "error": str(exc) or type(exc).__name__}
+
+    async def manage_group_participant(self, chat_id: str, address: str, action: str = "add") -> dict[str, Any]:
+        """Add or remove a participant in a group chat via the BlueBubbles Private API."""
+        act = (action or "").strip().lower()
+        if act not in {"add", "remove"}:
+            return {"success": False, "error": "Action must be 'add' or 'remove'"}
+        addr = (address or "").strip()
+        if not addr or not ("@" in addr or _ADDRESS_RE.match(addr) or _PHONE_RE.fullmatch(addr)):
+            return {"success": False, "error": "Participant address must be a phone number or email"}
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+        if not _is_group_chat_guid(guid):
+            return {"success": False, "error": "Participants can only be modified on a group chat (;+;)"}
+        try:
+            res = await self._api_post(
+                f"/api/v1/chat/{quote(guid, safe='')}/participant/{act}",
+                {"address": addr},
+            )
+            return {"success": True, "chat_guid": guid, "action": act, "address": addr, "data": res.get("data")}
+        except Exception as exc:
+            return {"success": False, "error": str(exc) or type(exc).__name__}
+
+    async def set_group_icon(self, chat_id: str, file_path: str) -> dict[str, Any]:
+        """Set a custom group chat icon via the BlueBubbles Private API."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        if not file_path or not await asyncio.to_thread(os.path.isfile, file_path):
+            return {"success": False, "error": f"File not found: {file_path}"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+        if not _is_group_chat_guid(guid):
+            return {"success": False, "error": "Group icon can only be set on a group chat (;+;)"}
+        try:
+            payload = await asyncio.to_thread(Path(file_path).read_bytes)
+            fname = os.path.basename(file_path)
+            res = await self.client.post(
+                self._api_url(f"/api/v1/chat/{quote(guid, safe='')}/icon"),
+                timeout=60,
+                files={"icon": (fname, payload, "application/octet-stream")},
+            )
+            res.raise_for_status()
+            return {"success": True, "chat_guid": guid}
+        except Exception as exc:
+            return {"success": False, "error": str(exc) or type(exc).__name__}
+
+    async def remove_group_icon(self, chat_id: str) -> dict[str, Any]:
+        """Remove a custom group chat icon via the BlueBubbles Private API."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+        if not _is_group_chat_guid(guid):
+            return {"success": False, "error": "Group icon can only be removed on a group chat (;+;)"}
+        try:
+            await self._api_delete(f"/api/v1/chat/{quote(guid, safe='')}/icon")
+            return {"success": True, "chat_guid": guid}
+        except Exception as exc:
+            return {"success": False, "error": str(exc) or type(exc).__name__}
+
+    async def leave_group(self, chat_id: str) -> dict[str, Any]:
+        """Leave a group chat via the BlueBubbles Private API."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+        if not _is_group_chat_guid(guid):
+            return {"success": False, "error": "Cannot leave a direct message chat; group chat (;+;) required"}
+        try:
+            await self._api_post(f"/api/v1/chat/{quote(guid, safe='')}/leave", {})
+            return {"success": True, "chat_guid": guid}
+        except Exception as exc:
+            return {"success": False, "error": str(exc) or type(exc).__name__}
+
+    # --- Focus status, handle availability, and FindMy (Private API) ---
+
+    async def get_focus_status(self, address: Optional[str] = None, *, chat_id: Optional[str] = None) -> dict[str, Any]:
+        """Query a recipient handle's Focus/DND status ('silenced', 'none', or 'unknown')."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        target_addr = (address or "").strip()
+        if not target_addr and chat_id:
+            _svc, delim, ident = _split_chat_guid(chat_id)
+            if delim != _GROUP_DELIMITER and ident:
+                target_addr = ident
+        if not target_addr or _is_group_chat_guid(target_addr):
+            return {"success": False, "error": "A handle address (phone or email) is required"}
+        try:
+            res = await self._api_get(f"/api/v1/handle/{quote(target_addr, safe='')}/focus")
+            data = res.get("data") or {}
+            return {"success": True, "address": target_addr, "status": data.get("status", "unknown")}
+        except Exception as exc:
+            return {"success": False, "error": str(exc) or type(exc).__name__}
+
+    async def check_availability(self, address: Optional[str] = None, *,
+                                 service: str = "imessage", chat_id: Optional[str] = None) -> dict[str, Any]:
+        """Check whether an address is registered with iMessage or FaceTime."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        svc = (service or "imessage").strip().lower()
+        if svc not in {"imessage", "facetime"}:
+            return {"success": False, "error": "Service must be 'imessage' or 'facetime'"}
+        target_addr = (address or "").strip()
+        if not target_addr and chat_id:
+            _svc, delim, ident = _split_chat_guid(chat_id)
+            if delim != _GROUP_DELIMITER and ident:
+                target_addr = ident
+        if not target_addr or _is_group_chat_guid(target_addr):
+            return {"success": False, "error": "A handle address (phone or email) is required"}
+        try:
+            res = await self._api_get(
+                f"/api/v1/handle/availability/{svc}?address={quote(target_addr, safe='')}"
+            )
+            data = res.get("data") or {}
+            return {
+                "success": True,
+                "address": target_addr,
+                "service": svc,
+                "available": bool(data.get("available")),
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc) or type(exc).__name__}
+
+    async def get_findmy_locations(self, target: str = "friends", *, refresh: bool = False) -> dict[str, Any]:
+        """Fetch or refresh FindMy friends or devices locations via the BlueBubbles server."""
+        if not self.client:
+            return {"success": False, "error": "Not connected"}
+        kind = (target or "friends").strip().lower()
+        if kind not in {"friends", "devices"}:
+            return {"success": False, "error": "Target must be 'friends' or 'devices'"}
+        if (kind == "friends" or refresh) and (not self._private_api_enabled or not self._helper_connected):
+            return {"success": False, "error": "BlueBubbles Private API helper is required for FindMy"}
+        try:
+            if refresh:
+                res = await self._api_post(f"/api/v1/icloud/findmy/{kind}/refresh", {})
+                if not res.get("data"):
+                    res = await self._api_get(f"/api/v1/icloud/findmy/{kind}")
+            else:
+                res = await self._api_get(f"/api/v1/icloud/findmy/{kind}")
+            return {"success": True, "target": kind, "refreshed": bool(refresh), "data": res.get("data")}
+        except Exception as exc:
+            return {"success": False, "error": str(exc) or type(exc).__name__}
 
     # --- Chat info ---
 
@@ -827,6 +1237,20 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         return strip_markdown(content, keep_link_targets=True)  # iMessage auto-links bare URLs only
 
     # --- Inbound attachment downloading ---
+
+    async def _force_download_attachment(self, att_guid: str) -> bool:
+        """Ask BlueBubbles Private API to force-download an offloaded/purged iCloud attachment."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return False
+        try:
+            resp = await self.client.get(
+                self._api_url(f"/api/v1/attachment/{quote(att_guid, safe='')}/download/force"),
+                timeout=30,
+                follow_redirects=True,
+            )
+            return 200 <= resp.status_code < 300
+        except Exception:
+            return False
 
     async def _download_attachment(self, att_guid: str, att_meta: dict[str, Any]) -> Optional[str]:
         """Download an attachment and cache it locally; local path or None on failure."""
