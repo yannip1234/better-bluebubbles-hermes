@@ -268,7 +268,11 @@ def lookup(args, **_kwargs):
     target = "friends" if query == "findmy_friends" else "devices"
     return _dispatch_adapter_coro(
         runner,
-        lambda: adapter.get_findmy_locations(target, refresh=refresh),
+        lambda: (
+            adapter.get_findmy_locations(target, refresh=refresh, address=address)
+            if address
+            else adapter.get_findmy_locations(target, refresh=refresh)
+        ),
         "FindMy lookup failed",
     )
 
@@ -459,7 +463,8 @@ def register_tools(ctx):
     lookup_desc = (
         "Query BlueBubbles Private API status and iCloud services: check recipient Focus/DND status "
         "(focus_status), check whether an address supports iMessage (imessage_availability) or FaceTime "
-        "(facetime_availability), or fetch FindMy locations (findmy_friends, findmy_devices)."
+        "(facetime_availability), or fetch FindMy locations (findmy_friends, findmy_devices) enriched with "
+        "contact names."
     )
     ctx.register_tool(
         name="bluebubbles_lookup",
@@ -475,7 +480,11 @@ def register_tools(ctx):
                     "query": {"type": "string", "enum": list(_LOOKUP_QUERIES)},
                     "address": {
                         "type": "string",
-                        "description": "Optional phone number or email for focus_status / availability checks (defaults to the current DM handle).",
+                        "description": (
+                            "Optional phone number or email for focus_status / availability checks "
+                            "(defaults to the current DM handle), or an optional contact name / handle "
+                            "filter for findmy_friends / findmy_devices."
+                        ),
                     },
                     "refresh": {
                         "type": "boolean",

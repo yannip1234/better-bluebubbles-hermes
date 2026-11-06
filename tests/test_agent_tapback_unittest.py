@@ -238,3 +238,74 @@ class ToolRuntimeTest(unittest.TestCase):
                 self.assertTrue(res_devices["success"])
             finally:
                 sc.clear_session_vars(tokens)
+
+    def test_findmy_contact_enrichment_and_macos_fallback(self):
+        adapter = BlueBubblesAdapter(PlatformConfig(extra={"server_url": "http://localhost:1234", "password": "fake"}))
+        adapter.client = object()
+        adapter._private_api_enabled = adapter._helper_connected = True
+        adapter._can_use_local_findmy_helper = lambda: True
+
+        contacts_payload = [
+            {
+                "firstName": "Dominik",
+                "lastName": "Airey",
+                "displayName": "Dominik Airey",
+                "phoneNumbers": [{"address": "+1 (781) 354-2095"}],
+                "emails": [{"address": "inkdo2@gmail.com"}],
+            },
+            {
+                "firstName": "Ian",
+                "lastName": "Pang",
+                "displayName": "Ian Pang",
+                "phoneNumbers": [{"address": "+16178035651"}],
+                "emails": [],
+            },
+        ]
+        raw_locations = [
+            {
+                "handle": "+17813542095",
+                "coordinates": [42.50547, -71.10775],
+                "short_address": "318 South St, Reading, MA",
+                "long_address": "318 South St, Reading, MA 01867, United States",
+                "title": None,
+                "status": "shallow",
+                "last_updated": 1793992234000,
+            },
+            {
+                "handle": "+16178035651",
+                "coordinates": [42.35046, -71.04524],
+                "short_address": "127 Autumn Ln, Boston, MA",
+                "long_address": "127 Autumn Ln, Boston, MA 02210, United States",
+                "title": None,
+                "status": "shallow",
+                "last_updated": 1793992234000,
+            },
+        ]
+
+        adapter._api_get = AsyncMock(
+            side_effect=lambda path: (
+                {"status": 200, "data": contacts_payload}
+                if path == "/api/v1/contact"
+                else {"status": 200, "data": []}
+            )
+        )
+        pushed = []
+
+        with patch("plugin.adapter.fetch_macos_findmy_friends", return_value=raw_locations), \
+             patch("plugin.adapter.push_findmy_locations_to_bluebubbles", side_effect=lambda items: pushed.extend(items) or True):
+            res_all = asyncio.run(adapter.get_findmy_locations("friends", refresh=False))
+            self.assertTrue(res_all["success"])
+            self.assertEqual(len(res_all["data"]), 2)
+            self.assertEqual(res_all["data"][0]["display_name"], "Dominik Airey")
+            self.assertEqual(res_all["data"][0]["title"], "Dominik Airey")
+            self.assertEqual(len(pushed), 2)
+
+            res_filtered = asyncio.run(
+                adapter.get_findmy_locations("friends", refresh=True, address="Dominik")
+            )
+            self.assertTrue(res_filtered["success"])
+            self.assertEqual(len(res_filtered["data"]), 1)
+            self.assertEqual(res_filtered["data"][0]["handle"], "+17813542095")
+            self.assertEqual(res_filtered["data"][0]["display_name"], "Dominik Airey")
+            self.assertIn("Reading, MA", res_filtered["data"][0]["short_address"])
+

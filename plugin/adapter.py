@@ -6,13 +6,15 @@ import json
 import logging
 import os
 import re
+import sys
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -26,6 +28,12 @@ from gateway.platforms.base import (
 from gateway.platforms.media_cache import ext_for_mime
 from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns, strip_markdown
 from utils import TRUTHY_STRINGS
+from .findmy import (
+    build_contact_name_map,
+    enrich_and_filter_findmy_friends,
+    fetch_macos_findmy_friends,
+    push_findmy_locations_to_bluebubbles,
+)
 from .inbound import (
     BlueBubblesInboundMixin,
     _DM_DELIMITER,
@@ -292,6 +300,8 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         self._sent_tapbacks: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._sent_messages: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._last_sent_by_chat: OrderedDict[str, str] = OrderedDict()
+        self._contact_name_cache: dict[str, str] = {}
+        self._contact_name_cache_ts: float = 0.0
         # The runner carries this shared cache across adapter rebuilds. Store only accepted content.
         self._dedup = MessageDeduplicator(max_size=2000, ttl_seconds=48 * 3600)
 
@@ -1197,7 +1207,43 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         except Exception as exc:
             return {"success": False, "error": str(exc) or type(exc).__name__}
 
-    async def get_findmy_locations(self, target: str = "friends", *, refresh: bool = False) -> dict[str, Any]:
+    def _can_use_local_findmy_helper(self) -> bool:
+        """True when running on macOS against a local BlueBubbles server with a live HTTP client."""
+        if sys.platform != "darwin" or not isinstance(self.client, httpx.AsyncClient):
+            return False
+        if isinstance(getattr(self.client, "_transport", None), httpx.MockTransport):
+            return False
+        host = (urlparse(self.server_url).hostname or "").lower()
+        return host in {"localhost", "127.0.0.1", "::1"}
+
+    async def _get_contact_name_map(self) -> dict[str, str]:
+        """Fetch and cache a normalized handle -> display name map from BlueBubbles ``/api/v1/contact``."""
+        now = time.monotonic()
+        if self._contact_name_cache and (now - self._contact_name_cache_ts) < 300.0:
+            return self._contact_name_cache
+        with suppress(Exception):
+            res = await self._api_get("/api/v1/contact")
+            contacts = res.get("data") if isinstance(res, dict) else None
+            if isinstance(contacts, list):
+                mapping = build_contact_name_map(contacts)
+                if mapping:
+                    self._contact_name_cache = mapping
+                    self._contact_name_cache_ts = now
+                return mapping
+        return self._contact_name_cache
+
+    async def _refresh_findmy_friends_local(self) -> list[dict[str, Any]]:
+        """Query macOS FindMyLocateSession directly, enrich with contact names, and warm BlueBubbles cache."""
+        items = await asyncio.to_thread(fetch_macos_findmy_friends, False)
+        if not items:
+            return []
+        contact_map = await self._get_contact_name_map()
+        enriched = enrich_and_filter_findmy_friends(items, contact_map)
+        await asyncio.to_thread(push_findmy_locations_to_bluebubbles, enriched)
+        return enriched
+
+    async def get_findmy_locations(self, target: str = "friends", *, refresh: bool = False,
+                                   address: Optional[str] = None) -> dict[str, Any]:
         """Fetch or refresh FindMy friends or devices locations via the BlueBubbles server."""
         if not self.client:
             return {"success": False, "error": "Not connected"}
@@ -1207,13 +1253,41 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         if (kind == "friends" or refresh) and (not self._private_api_enabled or not self._helper_connected):
             return {"success": False, "error": "BlueBubbles Private API helper is required for FindMy"}
         try:
-            if refresh:
-                res = await self._api_post(f"/api/v1/icloud/findmy/{kind}/refresh", {})
-                if not res.get("data"):
-                    res = await self._api_get(f"/api/v1/icloud/findmy/{kind}")
+            data: Any = None
+            if kind == "friends":
+                if refresh and self._can_use_local_findmy_helper():
+                    data = await self._refresh_findmy_friends_local()
+                if not data:
+                    if refresh:
+                        res = await self._api_post(f"/api/v1/icloud/findmy/{kind}/refresh", {})
+                        if not res.get("data"):
+                            res = await self._api_get(f"/api/v1/icloud/findmy/{kind}")
+                    else:
+                        res = await self._api_get(f"/api/v1/icloud/findmy/{kind}")
+                    data = res.get("data")
+                if not data and self._can_use_local_findmy_helper():
+                    data = await self._refresh_findmy_friends_local() or data
+                if isinstance(data, list) and data:
+                    contact_map = await self._get_contact_name_map()
+                    data = enrich_and_filter_findmy_friends(data, contact_map, query_filter=address)
             else:
-                res = await self._api_get(f"/api/v1/icloud/findmy/{kind}")
-            return {"success": True, "target": kind, "refreshed": bool(refresh), "data": res.get("data")}
+                if refresh:
+                    res = await self._api_post(f"/api/v1/icloud/findmy/{kind}/refresh", {})
+                    if not res.get("data"):
+                        res = await self._api_get(f"/api/v1/icloud/findmy/{kind}")
+                else:
+                    res = await self._api_get(f"/api/v1/icloud/findmy/{kind}")
+                data = res.get("data")
+                if address and isinstance(data, list):
+                    q = address.strip().lower()
+                    data = [
+                        d for d in data
+                        if isinstance(d, dict) and any(
+                            q in str(d.get(k) or "").lower()
+                            for k in ("name", "deviceDisplayName", "modelDisplayName", "identifier", "serialNumber")
+                        )
+                    ]
+            return {"success": True, "target": kind, "refreshed": bool(refresh), "data": data}
         except Exception as exc:
             return {"success": False, "error": str(exc) or type(exc).__name__}
 
