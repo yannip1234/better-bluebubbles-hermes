@@ -6,7 +6,7 @@ BlueBubbles iMessage platform plugin (`bluebubbles-platform`) for Hermes Agent. 
 
 - **Multi-profile DM and group routing.** Differentiates direct message chat GUIDs (`;-;`) from group chat GUIDs (`;+;`) so multiple Hermes profiles can share one BlueBubbles server and only accept or reply to their designated chats.
 - **Webhook hydration, late media, and inbound edits/unsends.** Merges sparse `new-message` and `updated-message` webhook deliveries by message GUID, hydrates missing chat or attachment metadata from `/api/v1/message/<guid>?with=chats,attachments`, forces Private API downloads for offloaded iCloud attachments, retries pending attachments for up to five minutes without replaying admitted text, and delivers user message edits (`dateEdited`) and unsends (`dateRetracted`) with distinct revision keys.
-- **Full BlueBubbles Private API support & agent tools.** Supports Tapback reactions (add & remove), editing and unsending sent messages, iMessage bubble & screen effects, bold subject lines, attachment reply threading, read/unread state, "Notify Anyway" on silenced chats, group chat management (rename, add/remove participants, set/remove group icon, leave group), recipient Focus/DND & iMessage/FaceTime availability checks, and FindMy Friends & Devices lookups.
+- **Full BlueBubbles Private API support & agent tools.** Supports Tapback reactions (add & remove), editing and unsending sent messages, iMessage bubble & screen effects, bold subject lines, attachment reply threading, read/unread state, "Notify Anyway" on silenced chats, group chat management (rename, add/remove participants, set/remove group icon, leave group), recipient Focus/DND & iMessage/FaceTime availability checks, and FindMy Friends & Devices lookups (with a native macOS 14+ `FindMyLocateSession` + `MapKit` helper, BlueBubbles `/api/v1/contact` name enrichment, and name/handle filtering).
 
 ## Agent Tools (`bluebubbles` toolset)
 
@@ -20,7 +20,7 @@ All chat-mutating tools authenticate against the active BlueBubbles turn context
 | `bluebubbles_unsend_message` | Unsend (retract) a previously sent bot message in the current chat (`message_id` defaults to `"last"`) |
 | `bluebubbles_send_effect` | Send an iMessage with a bubble effect (`slam`, `loud`, `gentle`, `invisible`), full-screen effect (`balloons`, `confetti`, `lasers`, `fireworks`, `shooting-star`, `celebration`, `love`, `echo`, `spotlight`), and/or bold `subject` line |
 | `bluebubbles_chat_action` | Run a Private API chat action on the current chat: `mark_read`, `mark_unread`, `notify_anyway`, `rename_group`, `add_participant`, `remove_participant`, `set_group_icon`, `remove_group_icon`, or `leave_group` |
-| `bluebubbles_lookup` | Query recipient Focus/DND status (`focus_status`), service availability (`imessage_availability`, `facetime_availability`), or FindMy locations (`findmy_friends`, `findmy_devices` with optional `refresh: true`) |
+| `bluebubbles_lookup` | Query recipient Focus/DND status (`focus_status`), service availability (`imessage_availability`, `facetime_availability`), or FindMy locations (`findmy_friends`, `findmy_devices` with optional `refresh: true` and optional `address` filter by contact name, phone, email, or device name) |
 
 ## Installation
 
