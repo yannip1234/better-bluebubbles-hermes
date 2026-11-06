@@ -78,6 +78,24 @@ No credentials are included here.
   Verify actual tool visibility and Private API behavior after deployment; enabling
   a plugin or toolset does not prove that a particular agent can call it.
 * Incoming tapbacks and self messages remain ignored, as in the bundled adapter.
+* Multi-profile DM (`;-;`) and group (`;+;`) chat routing:
+  * `allowed_chat_guids` (or `BLUEBUBBLES_ALLOWED_CHAT_GUIDS`): restricts a
+    profile to the listed BlueBubbles chat GUIDs (matching across service
+    prefixes such as `any;+;<id>`, `iMessage;+;<id>`, and `;+;<id>` while
+    strictly separating `;-;` direct messages from `;+;` group chats). Group
+    entries also populate `group_allowed_chats` for chat-scoped group
+    authorization.
+  * `ignore_direct_messages` (or `BLUEBUBBLES_IGNORE_DIRECT_MESSAGES`) and
+    `ignore_group_messages` (or `BLUEBUBBLES_IGNORE_GROUP_MESSAGES`): explicitly
+    ignore direct messages (`;-;`) or group chats (`;+;`) on a profile. When not
+    explicitly set, a profile whose `allowed_chat_guids` or `home_channel`
+    specifies only `;+;` group chats automatically ignores direct messages, and
+    a profile whose `allowed_chat_guids` or `home_channel` specifies only `;-;`
+    direct messages automatically ignores group chats.
+  * Outbound sends, attachments, reactions, typing indicators, and read receipts
+    also enforce the profile's DM/group routing and `allowed_chat_guids`, and
+    `_resolve_chat_guid` requires `;-;` for DM targets and `;+;` for group
+    targets.
 
 ## Arbitrary emoji Tapbacks: blocked on capability negotiation
 

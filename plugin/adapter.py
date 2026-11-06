@@ -2,6 +2,7 @@
 inbound webhooks (text, media attachments, typing indicators, read receipts)."""
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -25,7 +26,17 @@ from gateway.platforms.base import (
 from gateway.platforms.media_cache import ext_for_mime
 from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns, strip_markdown
 from utils import TRUTHY_STRINGS
-from .inbound import BlueBubblesInboundMixin, _InboundMessage
+from .inbound import (
+    BlueBubblesInboundMixin,
+    _DM_DELIMITER,
+    _GROUP_DELIMITER,
+    _InboundMessage,
+    _canonical_chat_guid_key,
+    _chat_guid_delimiter,
+    _is_dm_chat_guid,
+    _is_group_chat_guid,
+    _split_chat_guid,
+)
 
 # Historical BlueBubbles mime→ext maps, preserved verbatim as overrides for the shared dispatch in
 # gateway.platforms.media_cache. Both maps are CLOSED: unlisted mimes fall back to .jpg / .mp3.
@@ -100,6 +111,33 @@ def _ok():
     return web.Response(text="ok")
 
 
+def _parse_optional_bool(raw: Any) -> Optional[bool]:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if not text:
+        return None
+    return text in TRUTHY_STRINGS
+
+
+def _parse_chat_guid_list(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw).strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        with suppress(ValueError, TypeError):
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+    return [part.strip() for part in re.split(r"[,\n]", text) if part.strip()]
+
+
 class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
     serves_profile_prefix: bool = True
@@ -124,6 +162,84 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         self.require_mention = str(_require_mention).strip().lower() in TRUTHY_STRINGS
         self._mention_patterns = self._compile_mention_patterns(
             extra["mention_patterns"] if "mention_patterns" in extra else _get_scoped_secret("BLUEBUBBLES_MENTION_PATTERNS"))
+        raw_allowed_chats = (
+            extra.get("allowed_chat_guids")
+            if "allowed_chat_guids" in extra
+            else extra.get("allowed_chats")
+            if "allowed_chats" in extra
+            else _get_scoped_secret("BLUEBUBBLES_ALLOWED_CHAT_GUIDS")
+        )
+        self.allowed_chat_guids: list[str] = _parse_chat_guid_list(raw_allowed_chats)
+        self._allowed_chat_keys: set[str] = set()
+        self._allowed_dm_identifiers: set[str] = set()
+        self._allowed_group_identifiers: set[str] = set()
+        for entry in self.allowed_chat_guids:
+            key = _canonical_chat_guid_key(entry)
+            _svc, delim, ident = _split_chat_guid(entry)
+            if key and ident:
+                self._allowed_chat_keys.add(key)
+                if delim == _GROUP_DELIMITER:
+                    self._allowed_group_identifiers.add(ident.lower())
+                elif delim == _DM_DELIMITER:
+                    self._allowed_dm_identifiers.add(ident.lower())
+            elif ident:
+                self._allowed_dm_identifiers.add(ident.lower())
+                self._allowed_group_identifiers.add(ident.lower())
+
+        home_obj = getattr(config, "home_channel", None)
+        raw_home = (
+            getattr(home_obj, "chat_id", None)
+            or (home_obj.get("chat_id") if isinstance(home_obj, dict) else None)
+            or extra.get("home_channel")
+            or _get_scoped_secret("BLUEBUBBLES_HOME_CHANNEL")
+        )
+        if isinstance(raw_home, dict):
+            raw_home = raw_home.get("chat_id")
+        self.home_channel_chat_id: Optional[str] = str(raw_home).strip() if raw_home else None
+
+        raw_ignore_dm = (
+            extra.get("ignore_direct_messages")
+            if "ignore_direct_messages" in extra
+            else _get_scoped_secret("BLUEBUBBLES_IGNORE_DIRECT_MESSAGES")
+        )
+        raw_ignore_group = (
+            extra.get("ignore_group_messages")
+            if "ignore_group_messages" in extra
+            else _get_scoped_secret("BLUEBUBBLES_IGNORE_GROUP_MESSAGES")
+        )
+        explicit_ignore_dm = _parse_optional_bool(raw_ignore_dm)
+        explicit_ignore_group = _parse_optional_bool(raw_ignore_group)
+
+        has_allowed_groups = bool(self._allowed_group_identifiers)
+        has_allowed_dms = bool(self._allowed_dm_identifiers)
+
+        if explicit_ignore_dm is not None:
+            self.ignore_direct_messages = explicit_ignore_dm
+        elif has_allowed_groups and not has_allowed_dms:
+            self.ignore_direct_messages = True
+        elif not self.allowed_chat_guids and _is_group_chat_guid(self.home_channel_chat_id):
+            self.ignore_direct_messages = True
+        else:
+            self.ignore_direct_messages = False
+
+        if explicit_ignore_group is not None:
+            self.ignore_group_messages = explicit_ignore_group
+        elif has_allowed_dms and not has_allowed_groups:
+            self.ignore_group_messages = True
+        elif not self.allowed_chat_guids and _is_dm_chat_guid(self.home_channel_chat_id):
+            self.ignore_group_messages = True
+        else:
+            self.ignore_group_messages = False
+
+        if self._allowed_group_identifiers and isinstance(self.config.extra, dict):
+            group_chats = list(_parse_chat_guid_list(self.config.extra.get("group_allowed_chats")))
+            for group_id in sorted(self._allowed_group_identifiers):
+                for prefix in ("any", "iMessage", "SMS", ""):
+                    candidate = f"{prefix}{_GROUP_DELIMITER}{group_id}"
+                    if candidate not in group_chats:
+                        group_chats.append(candidate)
+            self.config.extra["group_allowed_chats"] = group_chats
+
         self.client: Optional[httpx.AsyncClient] = None
         self._runner = None
         self._private_api_enabled: Optional[bool] = None
@@ -205,8 +321,12 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         """Fire a private-API chat action (typing/read); True only if the call was made."""
         if not self._private_api_enabled or not self._helper_connected or not self.client:
             return False
+        if not self._is_target_allowed(chat_id):
+            return False
         with suppress(Exception):
             if guid := await self._resolve_chat_guid(chat_id):
+                if not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+                    return False
                 url = self._api_url(f"/api/v1/chat/{quote(guid, safe='')}/{action}")
                 await getattr(self.client, method)(url, timeout=5)
                 return True
@@ -392,27 +512,115 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         (await self.client.delete(self._api_url(f"/api/v1/webhook/{webhook_id}"))).raise_for_status()
 
     def _remember_chat_guid(self, address: str, guid: str) -> None:
-        self._guid_cache[address] = guid
-        self._guid_cache.move_to_end(address)
+        for key in (address, _canonical_chat_guid_key(guid), _canonical_chat_guid_key(address)):
+            if not key:
+                continue
+            self._guid_cache[key] = guid
+            self._guid_cache.move_to_end(key)
         while len(self._guid_cache) > _GUID_CACHE_SIZE:
             self._guid_cache.popitem(last=False)
+
+    def _is_chat_allowed(self, chat_guid: Optional[str], *, chat_identifier: Optional[str] = None,
+                         is_group: Optional[bool] = None) -> bool:
+        """Check whether *chat_guid* is permitted by this profile's DM (``;-;``) / group (``;+;``)
+        routing and ``allowed_chat_guids`` allowlist."""
+        delim = _chat_guid_delimiter(chat_guid)
+        if delim == _GROUP_DELIMITER:
+            if is_group is False:
+                return False
+            effective_is_group = True
+        elif delim == _DM_DELIMITER:
+            if is_group is True:
+                return False
+            effective_is_group = False
+        else:
+            effective_is_group = bool(is_group)
+
+        if effective_is_group and self.ignore_group_messages:
+            return False
+        if not effective_is_group and self.ignore_direct_messages:
+            return False
+
+        if not self.allowed_chat_guids:
+            return True
+
+        key = _canonical_chat_guid_key(chat_guid)
+        _svc, _delim, guid_ident = _split_chat_guid(chat_guid)
+        candidates = {
+            ident.strip().lower()
+            for ident in (guid_ident, chat_identifier)
+            if isinstance(ident, str) and ident.strip()
+        }
+        if effective_is_group:
+            if self._allowed_group_identifiers:
+                return bool((key and key in self._allowed_chat_keys)
+                            or (candidates & self._allowed_group_identifiers))
+            return not self.ignore_group_messages
+        if self._allowed_dm_identifiers:
+            return bool((key and key in self._allowed_chat_keys)
+                        or (candidates & self._allowed_dm_identifiers))
+        return not self.ignore_direct_messages
+
+    def _is_target_allowed(self, target: Optional[str]) -> bool:
+        """Check whether an outbound *target* (chat GUID or bare DM handle) is permitted on this profile."""
+        raw = (target or "").strip()
+        if not raw:
+            return False
+        delim = _chat_guid_delimiter(raw)
+        if delim == _GROUP_DELIMITER:
+            return self._is_chat_allowed(raw, is_group=True)
+        if delim == _DM_DELIMITER:
+            return self._is_chat_allowed(raw, is_group=False)
+        lowered = raw.lower()
+        if self._allowed_group_identifiers and lowered in self._allowed_group_identifiers and not (
+                "@" in raw or _ADDRESS_RE.match(raw) or _PHONE_RE.fullmatch(raw)):
+            return self._is_chat_allowed(f"any{_GROUP_DELIMITER}{raw}", chat_identifier=raw, is_group=True)
+        return self._is_chat_allowed(f"any{_DM_DELIMITER}{raw}", chat_identifier=raw, is_group=False)
 
     # --- Chat GUID resolution ---
 
     async def _resolve_chat_guid(self, target: str) -> Optional[str]:
         """Resolve an email/phone to a chat GUID (raw ``a;-;b`` GUIDs pass through). Matches strictly on
-        ``chatIdentifier`` / ``identifier``; participant membership is intentionally NOT a fallback —
-        the same contact appears in a 1:1 DM and any number of groups, so a participant match could
-        leak a DM reply into a group thread. ``None`` lets the caller create a fresh DM.
+        ``chatIdentifier`` / ``identifier`` and chat type (``;-;`` for DMs vs ``;+;`` for groups);
+        participant membership is intentionally NOT a fallback — the same contact appears in a 1:1 DM
+        and any number of groups, so a participant match could leak a DM reply into a group thread.
+        ``None`` lets the caller create a fresh DM when DMs are permitted.
 
         See #24157.
         """
         target = (target or "").strip()
-        if not target or ";" in target:
-            return target or None
-        if target in self._guid_cache:
-            self._guid_cache.move_to_end(target)
-            return self._guid_cache[target]
+        if not target:
+            return None
+        delim = _chat_guid_delimiter(target)
+        if delim is not None:
+            is_group = delim == _GROUP_DELIMITER
+            if not self._is_chat_allowed(target, is_group=is_group):
+                return None
+            service, _delim, ident = _split_chat_guid(target)
+            if service:
+                return target
+            for lookup in (target, _canonical_chat_guid_key(target), ident if not is_group else None):
+                if lookup and lookup in self._guid_cache:
+                    cached = self._guid_cache[lookup]
+                    if _chat_guid_delimiter(cached) == delim and self._is_chat_allowed(cached, is_group=is_group):
+                        self._guid_cache.move_to_end(lookup)
+                        return cached
+            return f"any{target}"
+        if not self._is_target_allowed(target):
+            return None
+        expect_group = (
+            bool(self._allowed_group_identifiers)
+            and target.lower() in self._allowed_group_identifiers
+            and not ("@" in target or _ADDRESS_RE.match(target) or _PHONE_RE.fullmatch(target))
+        )
+        expected_delim = _GROUP_DELIMITER if expect_group else _DM_DELIMITER
+        for lookup in (target, f"{expected_delim}{target.lower()}"):
+            if lookup in self._guid_cache:
+                cached = self._guid_cache[lookup]
+                if (_chat_guid_delimiter(cached) == expected_delim
+                        and self._is_chat_allowed(cached, chat_identifier=target, is_group=expect_group)):
+                    self._guid_cache.move_to_end(lookup)
+                    return cached
         with suppress(Exception):
             offset = 0
             seen = set()
@@ -422,6 +630,13 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                 for chat in chats:
                     guid = chat.get("guid") or chat.get("chatGuid")
                     if (chat.get("chatIdentifier") or chat.get("identifier")) == target and guid:
+                        if _chat_guid_delimiter(guid) != expected_delim:
+                            continue
+                        with suppress(TypeError, ValueError):
+                            if not expect_group and int(chat.get("style") or 0) == 43:
+                                continue
+                        if not self._is_chat_allowed(guid, chat_identifier=target, is_group=expect_group):
+                            continue
                         self._remember_chat_guid(target, guid)
                         return guid
                 page_ids = {chat.get("guid") or chat.get("chatGuid") for chat in chats}
@@ -448,6 +663,8 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         text = self.format_message(content)
         if not text:
             return SendResult(success=False, error="BlueBubbles send requires text")
+        if not self._is_target_allowed(chat_id):
+            return SendResult(success=False, error=f"BlueBubbles chat not allowed for this profile: {chat_id}")
         # Each paragraph becomes its own iMessage bubble; truncate any still too long.
         paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()] or [text]
         chunks = [c for para in paragraphs for c in (
@@ -456,9 +673,13 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         for chunk in chunks:
             guid = await self._resolve_chat_guid(chat_id)
             if not guid:
-                if self._private_api_enabled and ("@" in chat_id or _ADDRESS_RE.match(chat_id)):  # address → new chat
+                if (self._private_api_enabled and not self.ignore_direct_messages
+                        and ";" not in (chat_id or "")
+                        and ("@" in chat_id or _ADDRESS_RE.match(chat_id))):  # address → new chat
                     return await self._create_chat_for_handle(chat_id, chunk)
                 return SendResult(success=False, error=f"BlueBubbles chat not found for target: {chat_id}")
+            if not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+                return SendResult(success=False, error=f"BlueBubbles chat not allowed for this profile: {guid}")
             payload: dict[str, Any] = {"chatGuid": guid, "tempGuid": _temp_guid(), "message": chunk}
             if reply_to and self._private_api_enabled and self._helper_connected:
                 payload.update(method="private-api", selectedMessageGuid=reply_to, partIndex=0)
@@ -478,8 +699,10 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             return {"success": False, "error": "A message GUID is required"}
         if not self.client or not self._private_api_enabled or not self._helper_connected:
             return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
         guid = await self._resolve_chat_guid(chat_id)
-        if not guid:
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
             return {"success": False, "error": "Chat not found"}
         result = await self._post_message("/api/v1/message/react", {
             "chatGuid": guid, "selectedMessageGuid": message_id, "reaction": reaction, "partIndex": 0})
@@ -497,10 +720,13 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             return {"success": False, "error": "A message GUID is required"}
         if not self.client or not self._private_api_enabled or not self._helper_connected:
             return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
         guid = await self._resolve_chat_guid(chat_id)
         key = (guid, message_id)
         reaction = self._sent_tapbacks.get(key)
-        if not guid or not reaction:
+        if not guid or not reaction or not self._is_chat_allowed(
+                guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
             return {"success": False, "error": "No tapback recorded by this adapter for that message"}
         result = await self._post_message("/api/v1/message/react", {
             "chatGuid": guid, "selectedMessageGuid": message_id, "reaction": "-" + reaction, "partIndex": 0})
@@ -516,10 +742,12 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         """Send a file attachment via BlueBubbles multipart upload."""
         if not self.client:
             return SendResult(success=False, error="Not connected")
+        if not self._is_target_allowed(chat_id):
+            return SendResult(success=False, error=f"Chat not allowed for this profile: {chat_id}")
         if not await asyncio.to_thread(os.path.isfile, file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
         guid = await self._resolve_chat_guid(chat_id)
-        if not guid:
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
             return SendResult(success=False, error=f"Chat not found: {chat_id}")
         fname = filename or os.path.basename(file_path)
         try:
@@ -646,7 +874,12 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
     if not check_bluebubbles_requirements():
         return send_error("BlueBubbles requirements not met (need aiohttp + httpx).")
     try:
-        adapter = BlueBubblesAdapter(PlatformConfig(extra=dict(getattr(pconfig, "extra", None) or {})))
+        adapter = BlueBubblesAdapter(
+            PlatformConfig(
+                home_channel=getattr(pconfig, "home_channel", None),
+                extra=dict(getattr(pconfig, "extra", None) or {}),
+            )
+        )
         if not await adapter.connect():
             return send_error("BlueBubbles: failed to connect to server")
         try:

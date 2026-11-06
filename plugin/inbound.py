@@ -27,6 +27,45 @@ _INBOUND_CACHE_SIZE = 2000
 _INBOUND_CACHE_TTL = 300
 _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_DM_DELIMITER = ";-;"
+_GROUP_DELIMITER = ";+;"
+
+
+def _chat_guid_delimiter(value: Optional[str]) -> Optional[str]:
+    text = (value or "").strip()
+    if _GROUP_DELIMITER in text:
+        return _GROUP_DELIMITER
+    if _DM_DELIMITER in text:
+        return _DM_DELIMITER
+    return None
+
+
+def _is_dm_chat_guid(value: Optional[str]) -> bool:
+    return _chat_guid_delimiter(value) == _DM_DELIMITER
+
+
+def _is_group_chat_guid(value: Optional[str]) -> bool:
+    return _chat_guid_delimiter(value) == _GROUP_DELIMITER
+
+
+def _split_chat_guid(value: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return ``(service, delimiter, identifier)`` for a BlueBubbles chat GUID or bare target."""
+    text = (value or "").strip()
+    if not text:
+        return None, None, None
+    for delimiter in (_GROUP_DELIMITER, _DM_DELIMITER):
+        if delimiter in text:
+            service, identifier = text.split(delimiter, 1)
+            return service.strip() or None, delimiter, identifier.strip() or None
+    return None, None, text
+
+
+def _canonical_chat_guid_key(value: Optional[str]) -> Optional[str]:
+    """Service-agnostic chat key preserving the DM (``;-;``) vs group (``;+;``) delimiter."""
+    _service, delimiter, identifier = _split_chat_guid(value)
+    if not delimiter or not identifier:
+        return None
+    return f"{delimiter}{identifier.lower()}"
 
 
 @dataclass
@@ -184,15 +223,30 @@ class BlueBubblesInboundMixin:
 
     @staticmethod
     def _is_group_record(record: dict[str, Any], chat_guid: Optional[str]) -> bool:
-        if record.get("isGroup") or ";+;" in (chat_guid or ""):
+        delim = _chat_guid_delimiter(chat_guid)
+        if delim == _GROUP_DELIMITER:
+            return True
+        if delim == _DM_DELIMITER:
+            return False
+        if record.get("isGroup"):
             return True
         for chat in record.get("chats") or []:
             if not isinstance(chat, dict):
                 continue
+            item_delim = _chat_guid_delimiter(
+                chat.get("guid") or chat.get("chatGuid") or chat.get("[auth-key]")
+            )
+            if item_delim == _GROUP_DELIMITER:
+                return True
+            if item_delim == _DM_DELIMITER:
+                return False
             with suppress(TypeError, ValueError):
                 # BlueBubbles v1.9.9: group chats are style 43; one-to-one DMs are style 45.
-                if int(chat.get("style") or 0) == 43:
+                style = int(chat.get("style") or 0)
+                if style == 43:
                     return True
+                if style == 45:
+                    return False
         return False
 
     @staticmethod
@@ -387,11 +441,23 @@ class BlueBubblesInboundMixin:
             logger.warning("[bluebubbles] ignoring message with no resolvable chat GUID")
             return None
         is_group = self._is_group_record(record, chat_guid)
+        if not self._is_chat_allowed(chat_guid, chat_identifier=chat_identifier, is_group=is_group):
+            logger.debug("[bluebubbles] ignoring inbound %s message for unrouted chat %s",
+                         "group" if is_group else "dm", chat_guid)
+            return None
         chat_id = self._canonical_session_chat_id(chat_guid, chat_identifier, sender, is_group)
         if not sender or not chat_id:
             return None
-        if not is_group:
-            self._remember_chat_guid(chat_id, chat_guid)
+        self._remember_chat_guid(chat_id, chat_guid)
+        if chat_identifier and chat_identifier != chat_id and not is_group:
+            self._remember_chat_guid(chat_identifier, chat_guid)
+        if is_group and getattr(self, "_allowed_group_identifiers", None):
+            extra = getattr(getattr(self, "config", None), "extra", None)
+            if isinstance(extra, dict):
+                group_allowed = list(extra.get("group_allowed_chats") or [])
+                if chat_id not in group_allowed:
+                    group_allowed.append(chat_id)
+                    extra["group_allowed_chats"] = group_allowed
         return chat_guid, chat_id, chat_identifier, sender, is_group
 
     async def _deliver_inbound_message(self, payload, state, message_id, route):

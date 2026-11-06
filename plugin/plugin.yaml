@@ -61,3 +61,15 @@ optional_env:
     description: "Group wake-word regexes (JSON list or comma/newline-separated); default Hermes wake words"
     prompt: "Mention patterns"
     password: false
+  - name: BLUEBUBBLES_ALLOWED_CHAT_GUIDS
+    description: "Comma-separated BlueBubbles chat GUIDs allowed for this profile (;-; for DMs, ;+; for groups)"
+    prompt: "Allowed chat GUIDs (comma-separated)"
+    password: false
+  - name: BLUEBUBBLES_IGNORE_DIRECT_MESSAGES
+    description: "Ignore direct message chats (;-; GUIDs) on this profile (default false)"
+    prompt: "Ignore direct messages? (true/false)"
+    password: false
+  - name: BLUEBUBBLES_IGNORE_GROUP_MESSAGES
+    description: "Ignore group chats (;+; GUIDs) on this profile (default false)"
+    prompt: "Ignore group messages? (true/false)"
+    password: false

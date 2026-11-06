@@ -17,7 +17,12 @@ ENV_OVERRIDES = (
             ("send_read_receipts", "BLUEBUBBLES_SEND_READ_RECEIPTS", "true", is_truthy_value),
             ("require_mention", "BLUEBUBBLES_REQUIRE_MENTION", "", truthy_token),
         ),
-        optional=(("mention_patterns", "BLUEBUBBLES_MENTION_PATTERNS", mention_patterns),),
+        optional=(
+            ("mention_patterns", "BLUEBUBBLES_MENTION_PATTERNS", mention_patterns),
+            ("allowed_chat_guids", "BLUEBUBBLES_ALLOWED_CHAT_GUIDS", mention_patterns),
+            ("ignore_direct_messages", "BLUEBUBBLES_IGNORE_DIRECT_MESSAGES", truthy_token),
+            ("ignore_group_messages", "BLUEBUBBLES_IGNORE_GROUP_MESSAGES", truthy_token),
+        ),
     ),
     home_step(Platform.BLUEBUBBLES, "BLUEBUBBLES_HOME_CHANNEL"),
 )
