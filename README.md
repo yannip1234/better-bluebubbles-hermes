@@ -1,143 +1,123 @@
-# BlueBubbles connector (experimental; not deployment-ready)
+# bluebubbles-connector
 
-This is a standalone replacement platform plugin for the Hermes source revision
-`bf0203a794a07aac3ff764972ab9087baa4e4f4e`. Nothing has been installed or
-restarted. `plugin/` keeps the `bluebubbles-platform` plugin identity and the
-`bluebubbles` platform identity, settings and authorization environment from
-Hermes. It derives from Hermes BlueBubbles and PR #116401, head
-`7228bc9f6c5a0a4ff2168519035491a61c68a411` (MIT; see LICENSE). This is a
-snapshot of an unmerged PR, not a released upstream component.
+BlueBubbles iMessage platform plugin (`bluebubbles-platform`) for Hermes Agent. It connects Hermes to a macOS BlueBubbles server over HTTP for outbound messages, reactions, typing indicators, and read receipts, and registers a local webhook listener for inbound `new-message` and `updated-message` events.
 
-## Important compatibility blocker
+## Features
 
-**Do not deploy as a safe replacement yet.** The installed Hermes gateway is
-missing admission receipts for successful steering/redirect and plaintext
-approval. A plugin cannot infer acceptance from the generic handled flag, which
-also covers refusal. A patch for revision `bf0203a` only is supplied at
-`patches/hermes-bf0203a-admission-receipts.patch`. It was tested against a scratch
-copy of `gateway/`, not installed or deployed. The plugin locally adapts inline
-and debounce receipts; it cannot repair runner internals without the core patch.
+- **Multi-profile DM and group routing.** Differentiates direct message chat GUIDs (`;-;`) from group chat GUIDs (`;+;`) so multiple Hermes profiles can share one BlueBubbles server and only accept or reply to their designated chats.
+- **Webhook hydration and late media.** Merges sparse `new-message` and `updated-message` webhook deliveries by message GUID, hydrates missing chat or attachment metadata from `/api/v1/message/<guid>?with=chats,attachments`, and retries pending attachments for up to five minutes without replaying admitted text.
+- **Tapback reactions.** Provides `add_reaction`, `remove_reaction`, and the `bluebubbles_tapback` agent tool for the six native iMessage tapbacks (`love`, `like`, `dislike`, `laugh`, `emphasize`, `question`) through the BlueBubbles Private API.
 
-The patch records acceptance as soon as it recognizes a plaintext approval, before
-invoking its handler: a handler can resolve an approval and then raise. It consumes
-exceptions instead of falling
-through to queue/steer, preventing unsafe duplicate handling. This deliberately
-chooses at-most-once admission: if the handler fails before resolving anything,
-the approval may remain pending, and a 200 response is **not** proof of resolution.
-Handler and confirmation-delivery failures are logged; an operator must inspect
-and resolve uncertain approvals. Process crashes, cancellation, cache expiry and
-persistence are separate failure modes. A 503 on queue overflow indicates the
-message was not admitted; BlueBubbles retry behavior is unverified and must not
-be assumed. Review and broader testing remain required.
+## Installation
 
-The intended replacement location, after that blocker is resolved and in a
-separate planned change, is the profile's `plugins/platforms/bluebubbles/`
-directory. A user override shadows the bundled plugin but is **not** auto-enabled:
-its profile must explicitly enable `platforms/bluebubbles` in `plugins.enabled`.
-Without this, discovery can log that the override shadows the bundled copy while
-leaving no family-scoped adapter. Isolated real-Hermes multiplex discovery tests
-in `tests/test_plugin_discovery_mux.py` reproduce both the failure and successful
-adapter construction when explicitly enabled. This is a configuration fix, not
-an adapter code change. For a future separately approved deployment, enable it
-in the target profile with `hermes plugins enable platforms/bluebubbles
---no-allow-tool-override` under that profile's Hermes home; preserve the other
-plugin entries. Do not run built-in and replacement adapters concurrently
-against one webhook/server. Back up existing profile configuration and data.
-Neither a live gateway nor end-to-end BlueBubbles behavior has been tested.
-No credentials are included here.
+1. Apply the gateway admission receipt patch to the Hermes checkout if not already applied:
 
-## Behavior and limits
+```bash
+git -C ~/.hermes/hermes-agent apply patches/hermes-bf0203a-admission-receipts.patch
+```
 
-* Same-message updates are merged under per-GUID ownership, with accepted
-  content deduplication; chat GUID resolution is mandatory and groups never
-  fall back to sender DMs. Unknown routes are retained in memory for a later
-  update, not guessed.
-* Partial and late attachments are retained; pending media is retried for up to
-  five minutes; later media arrives separately without repeating accepted text.
-  In-memory state survives supported adapter handoff but not process restart;
-  dedup entries expire after 48 hours or cache eviction.
-* `add_reaction(chat_id, emoji, message_id)` and `remove_reaction(chat_id,
-  message_id)` implement the Hermes send-message reaction interface using the
-  BlueBubbles Private API. Explicit message GUID and Private API/helper are
-  required. The six native tapbacks and common emoji aliases are supported.
-  Removal only knows reactions sent by this adapter instance; it cannot infer
-  reactions after restart. The `bluebubbles_tapback` agent tool accepts only a
-  reaction name, never a destination. It uses the authenticated gateway turn's
-  current chat and triggering message GUID, with no environment fallback, and
-  requires a live profile-scoped adapter. Queued merged text uses the latest
-  merged message as its anchor. It fails closed outside a BlueBubbles turn.
-  No live server was contacted and no unrestricted outbound tool is enabled.
+2. Copy `plugin/` into each target profile's platform plugin directory:
 
-  For a future separately approved installation **after the blocker above is
-  resolved**, back up the existing profile plugin directory, copy this repo's
-  `plugin/` contents to `~/.hermes/profiles/family/plugins/platforms/bluebubbles/`,
-  explicitly enable `platforms/bluebubbles` as described above, and make the
-  `bluebubbles` toolset available on that platform with
-  `HERMES_HOME="$HOME/.hermes/profiles/family" hermes tools enable bluebubbles --platform bluebubbles`.
-  Restart the family gateway only in a separately authorized maintenance window.
-  Verify actual tool visibility and Private API behavior after deployment; enabling
-  a plugin or toolset does not prove that a particular agent can call it.
-* Incoming tapbacks and self messages remain ignored, as in the bundled adapter.
-* Multi-profile DM (`;-;`) and group (`;+;`) chat routing:
-  * `allowed_chat_guids` (or `BLUEBUBBLES_ALLOWED_CHAT_GUIDS`): restricts a
-    profile to the listed BlueBubbles chat GUIDs (matching across service
-    prefixes such as `any;+;<id>`, `iMessage;+;<id>`, and `;+;<id>` while
-    strictly separating `;-;` direct messages from `;+;` group chats). Group
-    entries also populate `group_allowed_chats` for chat-scoped group
-    authorization.
-  * `ignore_direct_messages` (or `BLUEBUBBLES_IGNORE_DIRECT_MESSAGES`) and
-    `ignore_group_messages` (or `BLUEBUBBLES_IGNORE_GROUP_MESSAGES`): explicitly
-    ignore direct messages (`;-;`) or group chats (`;+;`) on a profile. When not
-    explicitly set, a profile whose `allowed_chat_guids` or `home_channel`
-    specifies only `;+;` group chats automatically ignores direct messages, and
-    a profile whose `allowed_chat_guids` or `home_channel` specifies only `;-;`
-    direct messages automatically ignores group chats.
-  * Outbound sends, attachments, reactions, typing indicators, and read receipts
-    also enforce the profile's DM/group routing and `allowed_chat_guids`, and
-    `_resolve_chat_guid` requires `;-;` for DM targets and `;+;` for group
-    targets.
+```bash
+mkdir -p ~/.hermes/profiles/<profile>/plugins/platforms/bluebubbles
+rsync -av --delete --exclude="__pycache__" plugin/ \
+  ~/.hermes/profiles/<profile>/plugins/platforms/bluebubbles/
+```
 
-## Arbitrary emoji Tapbacks: blocked on capability negotiation
+3. Enable the plugin and toolset in `config.yaml` for each profile:
 
-Arbitrary Unicode Tapbacks are **not implemented** in this connector. The open
-[server PR #839](https://github.com/BlueBubblesApp/bluebubbles-server/pull/839)
-accepts custom emoji in the existing `reaction` field, and uses a leading `-`
-for removal. Its diff does not expose an HTTP capability that proves both the
-server and the currently connected helper support that contract. The ordinary
-`private_api` and `helper_connected` flags do not prove emoji support. The
-[helper PR #78](https://github.com/BlueBubblesApp/bluebubbles-helper/pull/78)
-is a draft that advertises `custom_emoji_reactions` to the server in the helper
-ping; that alone does not establish an HTTP capability available to this client.
-Do not assume an OS or version number, a connected helper, or a local opt-in
-proves runtime capability. The related helper PR #68 is closed.
+```yaml
+plugins:
+  enabled:
+    - platforms/bluebubbles
+platform_toolsets:
+  bluebubbles:
+    - hermes-bluebubbles
+    - bluebubbles
+```
 
-Until a server-level runtime capability contract is available, custom emoji
-fail closed and classic Tapbacks remain unchanged. Implementation will also
-need to address capability changes/disconnects, Unicode single-emoji validation
-(including ZWJ, skin tones, flags and keycaps), alias collisions with classic
-Tapbacks, safe add/remove semantics, and actual delivery verification. Mock
-transport tests cannot prove these behaviors on the target Messages runtime.
+4. Restart the gateway:
+
+```bash
+hermes -p default gateway restart
+```
+
+## Configuration
+
+### Environment variables
+
+| Variable | Description |
+| --- | --- |
+| `BLUEBUBBLES_SERVER_URL` | BlueBubbles server URL, such as `http://127.0.0.1:1234` (required) |
+| `BLUEBUBBLES_PASSWORD` | BlueBubbles server API password (required) |
+| `BLUEBUBBLES_ALLOWED_USERS` | Comma-separated phone numbers or emails allowed to message the bot |
+| `BLUEBUBBLES_ALLOW_ALL_USERS` | Allow any sender when set to `true` |
+| `BLUEBUBBLES_HOME_CHANNEL` | Default chat GUID or address for notifications and cron delivery |
+| `BLUEBUBBLES_ALLOWED_CHAT_GUIDS` | Comma-separated chat GUIDs allowed on this profile |
+| `BLUEBUBBLES_IGNORE_DIRECT_MESSAGES` | Ignore direct messages (`;-;` chat GUIDs) when `true` |
+| `BLUEBUBBLES_IGNORE_GROUP_MESSAGES` | Ignore group chats (`;+;` chat GUIDs) when `true` |
+| `BLUEBUBBLES_REQUIRE_MENTION` | Require a wake word in group chats (`true` or `false`, default `false`) |
+| `BLUEBUBBLES_MENTION_PATTERNS` | Group wake-word regexes (JSON list or comma-separated) |
+| `BLUEBUBBLES_SEND_READ_RECEIPTS` | Mark inbound messages read automatically (`true` or `false`, default `true`) |
+| `BLUEBUBBLES_WEBHOOK_HOST` | Webhook bind host (default `127.0.0.1`) |
+| `BLUEBUBBLES_WEBHOOK_PORT` | Webhook bind port (default `8645`) |
+| `BLUEBUBBLES_WEBHOOK_PATH` | Webhook path (default `/bluebubbles-webhook`) |
+
+### Sharing one BlueBubbles server across multiple profiles
+
+When two Hermes profiles connect to the same BlueBubbles server, BlueBubbles delivers every webhook event to both profiles. The adapter scopes each profile using `allowed_chat_guids`, `ignore_direct_messages`, `ignore_group_messages`, and `home_channel`:
+
+- Chat GUIDs containing `;+;` are group chats (for example `any;+;74ca28f2630d48908a8b72a9d3865376` or `iMessage;+;74ca28f2630d48908a8b72a9d3865376`).
+- Chat GUIDs containing `;-;` are direct messages (for example `any;-;+16179431941` or `iMessage;-;+16179431941`).
+- Service prefixes (`any`, `iMessage`, `SMS`, or a leading `;-;` / `;+;`) match the same chat identifier while keeping DMs and groups separate.
+- If a profile sets `home_channel.chat_id` or `allowed_chat_guids` to only `;-;` DM GUIDs, `ignore_group_messages` defaults to `true`.
+- If a profile sets `home_channel.chat_id` or `allowed_chat_guids` to only `;+;` group GUIDs, `ignore_direct_messages` defaults to `true`.
+- Outbound sends, attachments, reactions, typing indicators, and read receipts enforce the same chat rules so a profile cannot reply to another profile's chat GUID.
+
+#### Example: group-only profile (`~/.hermes/profiles/family/config.yaml`)
+
+```yaml
+platforms:
+  bluebubbles:
+    enabled: true
+    home_channel:
+      platform: bluebubbles
+      chat_id: any;+;74ca28f2630d48908a8b72a9d3865376
+    extra:
+      require_mention: false
+      allowed_chat_guids:
+        - "any;+;74ca28f2630d48908a8b72a9d3865376"
+      ignore_direct_messages: true
+```
+
+#### Example: DM-only profile (`~/.hermes/profiles/personal/config.yaml`)
+
+```yaml
+platforms:
+  push:
+    gateway_restart_notification: false
+  bluebubbles:
+    enabled: true
+    allowed_users:
+      - "yannipang@icloud.com"
+      - "+16179431941"
+    home_channel:
+      platform: bluebubbles
+      chat_id: "any;-;+16179431941"
+    extra:
+      require_mention: false
+```
 
 ## Tests
 
-Tests use synthetic messages and a fake transport; they do not contact an
-actual BlueBubbles server. Upstream tests are adapted to import this plugin.
-Use the Hermes Python environment with its runtime dependencies and install
-`pytest` and `pytest-asyncio` in an isolated environment. To avoid touching a
-real profile or triggering Hermes maintenance/re-exec, set `HERMES_HOME` to an
-empty temporary directory, `HERMES_DISABLE_LAZY_INSTALLS=1`, and
-`HERMES_SUPERVISED_CHILD=1`. Include this project and the Hermes checkout in
-`PYTHONPATH`, then run `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest
--p pytest_asyncio.plugin tests`. Disabling auto-loading avoids registering the
-asyncio plugin twice in environments that discover it automatically.
+Run the test suite with an isolated `HERMES_HOME`:
 
-Latest isolated run: **53 passed** with the patch applied to a scratch gateway
-copy. This includes real-runner queue, steer, interrupt, plaintext approval and
-deny, handler/delivery exceptions, replay, and a normal `yes` without a pending
-approval. Four copied upstream gateway test files covering approval routing,
-authority, redirect anchors, and steer/subagent behavior: **19 passed**. The
-installed core remains unmodified and still needs the patch. Four
-`datetime.utcnow()` deprecation warnings and an asyncio fixture-scope warning
-were reported. These tests do not prove live group privacy, media recovery,
-approval resolution on handler failure, or gateway-wide behavior. No live
-messages were sent.
+```bash
+TMPDIR=/private/tmp \
+HERMES_HOME=$(mktemp -d /private/tmp/hh.XXXXXX) \
+HERMES_DISABLE_LAZY_INSTALLS=1 \
+HERMES_SUPERVISED_CHILD=1 \
+PYTHONPATH=".:$HOME/.hermes/hermes-agent" \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+pytest -p pytest_asyncio.plugin tests
+```
