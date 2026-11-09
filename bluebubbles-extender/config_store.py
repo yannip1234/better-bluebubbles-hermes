@@ -375,7 +375,9 @@ def _parse_dotenv(path: Path) -> dict[str, str]:
         k, v = line.split("=", 1)
         key = k.strip()
         val = v.strip()
-        if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+        if len(val) >= 2 and val[0] == val[-1] == '"':
+            val = val[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        elif len(val) >= 2 and val[0] == val[-1] == "'":
             val = val[1:-1]
         if key:
             out[key] = val

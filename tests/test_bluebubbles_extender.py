@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 import importlib.util
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+with suppress(Exception):
+    import hermes_bootstrap  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXTENDER_DIR = PROJECT_ROOT / "bluebubbles-extender"
