@@ -169,6 +169,36 @@ class BlueBubblesExtenderTest(unittest.TestCase):
             self.assertEqual(save_res["profile_state"]["meta"]["routing_mode"], "group_only")
             self.assertTrue(save_res["sync_result"]["ok"])
 
+    def test_desktop_plugin_and_config_schema_sync(self) -> None:
+        desktop_js = EXTENDER_DIR / "desktop" / "plugin.js"
+        self.assertTrue(desktop_js.is_file())
+        js_text = desktop_js.read_text(encoding="utf-8")
+        self.assertIn("registerSettingsPage", js_text)
+        self.assertIn("@hermes/plugin-sdk", js_text)
+
+        manifest_data = self.cs._load_yaml_file(EXTENDER_DIR / "plugin.yaml")
+        schema = manifest_data.get("config_schema")
+        self.assertIsInstance(schema, dict)
+        self.assertIn("server_url", schema)
+        self.assertIn("password", schema)
+        self.assertIn("allowed_chat_guids", schema)
+        self.assertIn("ignore_direct_messages", schema)
+        self.assertIn("ignore_group_messages", schema)
+
+        self.cs.write_profile_settings(
+            "personal",
+            {
+                "server_url": "http://127.0.0.1:1234",
+                "ignore_group_messages": True,
+                "allowed_users": ["+16179431941"],
+            },
+            root=self.root,
+        )
+        cfg = self.cs._load_yaml_file(self.root / "profiles" / "personal" / "config.yaml")
+        ext_entry = cfg.get("plugins", {}).get("entries", {}).get("bluebubbles-extender", {}).get("settings", {})
+        self.assertTrue(ext_entry.get("ignore_group_messages"))
+        self.assertEqual(ext_entry.get("allowed_users"), ["+16179431941"])
+
 
 if __name__ == "__main__":
     unittest.main()

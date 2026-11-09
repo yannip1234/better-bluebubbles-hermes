@@ -509,6 +509,9 @@ def read_profile_settings(
     cfg = _load_yaml_file(prof_dir / "config.yaml")
     plugins_sec = cfg.get("plugins") if isinstance(cfg.get("plugins"), dict) else {}
     enabled_plugins = plugins_sec.get("enabled") if isinstance(plugins_sec.get("enabled"), list) else []
+    entries_sec = plugins_sec.get("entries") if isinstance(plugins_sec.get("entries"), dict) else {}
+    ext_entry = entries_sec.get("bluebubbles-extender") if isinstance(entries_sec.get("bluebubbles-extender"), dict) else {}
+    ext_settings = ext_entry.get("settings") if isinstance(ext_entry.get("settings"), dict) else {}
 
     toolsets_sec = cfg.get("platform_toolsets") if isinstance(cfg.get("platform_toolsets"), dict) else {}
     bb_toolsets = toolsets_sec.get("bluebubbles") if isinstance(toolsets_sec.get("bluebubbles"), list) else []
@@ -519,7 +522,9 @@ def read_profile_settings(
     bb_home = bb_cfg.get("home_channel") if isinstance(bb_cfg.get("home_channel"), dict) else {}
     push_cfg = platforms_sec.get("push") if isinstance(platforms_sec.get("push"), dict) else {}
 
-    def _pick(yaml_val: Any, env_key: Optional[str], default: Any) -> Any:
+    def _pick(yaml_val: Any, env_key: Optional[str], default: Any, schema_key: Optional[str] = None) -> Any:
+        if schema_key and schema_key in ext_settings and ext_settings[schema_key] is not None and ext_settings[schema_key] != "":
+            return ext_settings[schema_key]
         if yaml_val is not None and yaml_val != "":
             return yaml_val
         if env_key and env_key in merged_env and merged_env[env_key] != "":
@@ -529,30 +534,45 @@ def read_profile_settings(
     raw_password = str(_pick(bb_extra.get("password"), "BLUEBUBBLES_PASSWORD", "") or "")
     has_password = bool(raw_password)
 
-    server_url = str(_pick(bb_extra.get("server_url"), "BLUEBUBBLES_SERVER_URL", "http://127.0.0.1:1234") or "").rstrip("/")
-    allowed_chat_guids = _as_list(_pick(bb_extra.get("allowed_chat_guids"), "BLUEBUBBLES_ALLOWED_CHAT_GUIDS", []))
-    ignore_dm = _as_bool(_pick(bb_extra.get("ignore_direct_messages"), "BLUEBUBBLES_IGNORE_DIRECT_MESSAGES", False))
-    ignore_group = _as_bool(_pick(bb_extra.get("ignore_group_messages"), "BLUEBUBBLES_IGNORE_GROUP_MESSAGES", False))
+    server_url = str(_pick(bb_extra.get("server_url"), "BLUEBUBBLES_SERVER_URL", "http://127.0.0.1:1234", "server_url") or "").rstrip("/")
+    allowed_chat_guids = _as_list(_pick(bb_extra.get("allowed_chat_guids"), "BLUEBUBBLES_ALLOWED_CHAT_GUIDS", [], "allowed_chat_guids"))
+    ignore_dm = _as_bool(_pick(bb_extra.get("ignore_direct_messages"), "BLUEBUBBLES_IGNORE_DIRECT_MESSAGES", False, "ignore_direct_messages"))
+    ignore_group = _as_bool(_pick(bb_extra.get("ignore_group_messages"), "BLUEBUBBLES_IGNORE_GROUP_MESSAGES", False, "ignore_group_messages"))
 
     yaml_allowed_users = bb_cfg.get("allowed_users") if bb_cfg.get("allowed_users") is not None else bb_extra.get("allowed_users")
-    allowed_users = _as_list(_pick(yaml_allowed_users, "BLUEBUBBLES_ALLOWED_USERS", []))
-    allow_all_users = _as_bool(_pick(bb_extra.get("allow_all_users"), "BLUEBUBBLES_ALLOW_ALL_USERS", False))
+    allowed_users = _as_list(_pick(yaml_allowed_users, "BLUEBUBBLES_ALLOWED_USERS", [], "allowed_users"))
+    allow_all_users = _as_bool(_pick(bb_extra.get("allow_all_users"), "BLUEBUBBLES_ALLOW_ALL_USERS", False, "allow_all_users"))
 
-    home_channel = str(_pick(bb_home.get("chat_id"), "BLUEBUBBLES_HOME_CHANNEL", "") or "")
-    home_channel_name = str(_pick(bb_home.get("name"), "BLUEBUBBLES_HOME_CHANNEL_NAME", "") or "")
+    home_channel = str(_pick(bb_home.get("chat_id"), "BLUEBUBBLES_HOME_CHANNEL", "", "home_channel") or "")
+    home_channel_name = str(_pick(bb_home.get("name"), "BLUEBUBBLES_HOME_CHANNEL_NAME", "", "home_channel_name") or "")
 
-    require_mention = _as_bool(_pick(bb_extra.get("require_mention"), "BLUEBUBBLES_REQUIRE_MENTION", False))
-    mention_patterns = _as_list(_pick(bb_extra.get("mention_patterns"), "BLUEBUBBLES_MENTION_PATTERNS", []))
-    send_read_receipts = _as_bool(_pick(bb_extra.get("send_read_receipts"), "BLUEBUBBLES_SEND_READ_RECEIPTS", True), True)
+    require_mention = _as_bool(_pick(bb_extra.get("require_mention"), "BLUEBUBBLES_REQUIRE_MENTION", False, "require_mention"))
+    mention_patterns = _as_list(_pick(bb_extra.get("mention_patterns"), "BLUEBUBBLES_MENTION_PATTERNS", [], "mention_patterns"))
+    send_read_receipts = _as_bool(_pick(bb_extra.get("send_read_receipts"), "BLUEBUBBLES_SEND_READ_RECEIPTS", True, "send_read_receipts"), True)
 
-    webhook_host = str(_pick(bb_extra.get("webhook_host"), "BLUEBUBBLES_WEBHOOK_HOST", "127.0.0.1") or "127.0.0.1")
-    webhook_port = _as_int(_pick(bb_extra.get("webhook_port"), "BLUEBUBBLES_WEBHOOK_PORT", 8645), 8645)
-    webhook_path = str(_pick(bb_extra.get("webhook_path"), "BLUEBUBBLES_WEBHOOK_PATH", "/bluebubbles-webhook") or "/bluebubbles-webhook")
+    webhook_host = str(_pick(bb_extra.get("webhook_host"), "BLUEBUBBLES_WEBHOOK_HOST", "127.0.0.1", "webhook_host") or "127.0.0.1")
+    webhook_port = _as_int(_pick(bb_extra.get("webhook_port"), "BLUEBUBBLES_WEBHOOK_PORT", 8645, "webhook_port"), 8645)
+    webhook_path = str(_pick(bb_extra.get("webhook_path"), "BLUEBUBBLES_WEBHOOK_PATH", "/bluebubbles-webhook", "webhook_path") or "/bluebubbles-webhook")
 
-    platform_enabled = _as_bool(bb_cfg.get("enabled"), default=bool(server_url and has_password))
-    plugin_enabled = any(str(x).strip() in {"platforms/bluebubbles", "bluebubbles-platform"} for x in enabled_plugins)
-    toolsets_enabled = "bluebubbles" in [str(x).strip() for x in bb_toolsets]
-    suppress_restart_push = push_cfg.get("gateway_restart_notification") is False
+    platform_enabled = _as_bool(
+        ext_settings["platform_enabled"] if "platform_enabled" in ext_settings else bb_cfg.get("enabled"),
+        default=bool(server_url and has_password),
+    )
+    plugin_enabled = (
+        _as_bool(ext_settings["plugin_enabled"], default=True)
+        if "plugin_enabled" in ext_settings
+        else any(str(x).strip() in {"platforms/bluebubbles", "bluebubbles-platform"} for x in enabled_plugins)
+    )
+    toolsets_enabled = (
+        _as_bool(ext_settings["toolsets_enabled"], default=True)
+        if "toolsets_enabled" in ext_settings
+        else "bluebubbles" in [str(x).strip() for x in bb_toolsets]
+    )
+    suppress_restart_push = (
+        _as_bool(ext_settings["suppress_restart_push"], default=False)
+        if "suppress_restart_push" in ext_settings
+        else (push_cfg.get("gateway_restart_notification") is False)
+    )
 
     effective = {
         "server_url": server_url,
@@ -783,6 +803,36 @@ def write_profile_settings(
         else:
             extra.pop("webhook_path", None)
 
+        # 5. plugins.entries.bluebubbles-extender.settings (mirrors config_schema for Hermes Desktop Settings > Plugins)
+        entries_sec = plugins_sec.setdefault("entries", {})
+        if not isinstance(entries_sec, dict):
+            entries_sec = {}
+            plugins_sec["entries"] = entries_sec
+        ext_entry = entries_sec.setdefault("bluebubbles-extender", {})
+        if not isinstance(ext_entry, dict):
+            ext_entry = {}
+            entries_sec["bluebubbles-extender"] = ext_entry
+        ext_entry["settings"] = {
+            "server_url": server_url,
+            "platform_enabled": platform_enabled,
+            "plugin_enabled": plugin_enabled,
+            "toolsets_enabled": toolsets_enabled,
+            "allowed_chat_guids": allowed_chat_guids,
+            "ignore_direct_messages": ignore_dm,
+            "ignore_group_messages": ignore_group,
+            "allowed_users": allowed_users,
+            "allow_all_users": allow_all_users,
+            "home_channel": home_channel,
+            "home_channel_name": home_channel_name,
+            "suppress_restart_push": suppress_restart_push,
+            "require_mention": require_mention,
+            "mention_patterns": mention_patterns,
+            "send_read_receipts": send_read_receipts,
+            "webhook_host": webhook_host,
+            "webhook_port": webhook_port,
+            "webhook_path": webhook_path,
+        }
+
     _save_yaml_file(prof_dir / "config.yaml", _mutate_yaml)
 
     if sync_dotenv:
@@ -809,6 +859,24 @@ def write_profile_settings(
         _update_dotenv_file(prof_dir / ".env", env_updates)
 
     return read_profile_settings(prof_name, root=hermes_root)
+
+
+def sync_plugin_entry_to_platform(
+    profile: Optional[str] = None,
+    *,
+    root: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Synchronize ``platforms.bluebubbles`` and ``plugins.entries.bluebubbles-extender.settings``."""
+    return write_profile_settings(profile, {}, root=root, sync_dotenv=True)
+
+
+def sync_all_profiles_settings(*, root: Optional[Path] = None) -> list[dict[str, Any]]:
+    """Ensure every profile's ``plugins.entries.bluebubbles-extender.settings`` and ``platforms.bluebubbles`` match."""
+    hermes_root = resolve_hermes_root(root)
+    results: list[dict[str, Any]] = []
+    for prof in list_profiles(root=hermes_root):
+        results.append(sync_plugin_entry_to_platform(prof["name"], root=hermes_root))
+    return results
 
 
 # --- Live BlueBubbles Server HTTP helpers -----------------------------------

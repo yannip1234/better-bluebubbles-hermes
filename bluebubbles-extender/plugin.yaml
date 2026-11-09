@@ -15,3 +15,102 @@ provides_hooks: []
 config_keys:
   - platforms.bluebubbles
   - platform_toolsets.bluebubbles
+config_schema:
+  server_url:
+    type: str
+    label: BlueBubbles Server URL
+    default: "http://127.0.0.1:1234"
+    required: true
+    description: Base URL of your macOS BlueBubbles Server (Settings -> API).
+  password:
+    type: secret
+    secret: true
+    env: BLUEBUBBLES_PASSWORD
+    label: BlueBubbles Server Password
+    required: true
+    description: API password configured in BlueBubbles Server (stored in .env).
+  platform_enabled:
+    type: bool
+    label: Enable BlueBubbles Platform Adapter
+    default: true
+    description: Enable platforms.bluebubbles.enabled in this profile's config.yaml.
+  plugin_enabled:
+    type: bool
+    label: Enable Profile Plugin Override (platforms/bluebubbles)
+    default: true
+    description: Load this profile's custom platforms/bluebubbles plugin instead of the bundled copy.
+  toolsets_enabled:
+    type: bool
+    label: Enable BlueBubbles Agent Toolset
+    default: true
+    description: Expose BlueBubbles agent tools (tapback, edit, unsend, effect, chat action, lookup).
+  allowed_chat_guids:
+    type: list
+    label: Allowed Chat GUIDs
+    default: []
+    description: Restrict this profile to specific chat GUIDs (;-; for DMs, ;+; for group chats).
+  ignore_direct_messages:
+    type: bool
+    label: Ignore Direct Messages (;-;)
+    default: false
+    description: Drop all 1:1 direct message chats on this profile.
+  ignore_group_messages:
+    type: bool
+    label: Ignore Group Chats (;+;)
+    default: false
+    description: Drop all group chats on this profile.
+  allowed_users:
+    type: list
+    label: Allowed Senders (Phone / Email)
+    default: []
+    description: Phone numbers (E.164) or Apple ID emails allowed to talk to the bot.
+  allow_all_users:
+    type: bool
+    label: Allow All Senders
+    default: false
+    description: Allow any iMessage sender in allowed chats without checking the sender allowlist.
+  home_channel:
+    type: str
+    label: Home Channel (Chat GUID or Address)
+    default: ""
+    description: Default iMessage chat GUID or handle for cron job delivery and notifications.
+  home_channel_name:
+    type: str
+    label: Home Channel Display Name
+    default: ""
+    description: Optional friendly label for the home channel.
+  suppress_restart_push:
+    type: bool
+    label: Suppress Gateway Restart Push Notifications
+    default: false
+    description: Keep gateway restarts silent on this profile.
+  require_mention:
+    type: bool
+    label: Require Wake-Word / Mention in Groups
+    default: false
+    description: Only respond in group chats when a wake-word pattern matches or a bot message is replied to.
+  mention_patterns:
+    type: list
+    label: Group Wake-Word Regex Patterns
+    default: []
+    description: Custom wake-word regular expressions when Require Mention is enabled.
+  send_read_receipts:
+    type: bool
+    label: Automatically Send Read Receipts
+    default: true
+    description: Mark inbound messages as read via the Private API when accepted by the gateway.
+  webhook_host:
+    type: str
+    label: Webhook Listener Host
+    default: "127.0.0.1"
+    description: Local bind IP for the standalone webhook listener.
+  webhook_port:
+    type: int
+    label: Webhook Listener Port
+    default: 8645
+    description: Local port for the standalone webhook listener.
+  webhook_path:
+    type: str
+    label: Webhook Listener Path
+    default: "/bluebubbles-webhook"
+    description: HTTP path where BlueBubbles posts webhook events.

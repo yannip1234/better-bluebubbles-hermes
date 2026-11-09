@@ -197,7 +197,19 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.BLUEBUBBLES)
-        extra = config.extra or {}
+        extra = dict(config.extra or {})
+        with suppress(Exception):
+            from hermes_cli.config import load_config_readonly
+            raw_cfg = load_config_readonly() or {}
+            ext_settings = (
+                ((raw_cfg.get("plugins") or {}).get("entries") or {})
+                .get("bluebubbles-extender", {})
+                .get("settings")
+            )
+            if isinstance(ext_settings, dict):
+                for k, v in ext_settings.items():
+                    if v is not None and v != "":
+                        extra[k] = v
         self.server_url = _normalize_server_url(_extra_or_secret(extra, "server_url", "BLUEBUBBLES_SERVER_URL"))
         self.password = extra.get("password") or _get_scoped_secret("BLUEBUBBLES_PASSWORD", "")
         self.webhook_host = _extra_or_secret(extra, "webhook_host", "BLUEBUBBLES_WEBHOOK_HOST", DEFAULT_WEBHOOK_HOST)
