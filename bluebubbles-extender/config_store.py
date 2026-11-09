@@ -18,10 +18,36 @@ from typing import Any, Optional
 from urllib.parse import quote, urlencode
 from urllib.request import Request as UrlRequest, urlopen
 
-try:
-    import hermes_yaml as _hermes_yaml
-except ImportError:
-    _hermes_yaml = None  # type: ignore[assignment]
+def _bootstrap_hermes_yaml():
+    try:
+        import hermes_yaml as hy
+        return hy
+    except ImportError:
+        pass
+    hermes_base = Path.home() / ".hermes"
+    for sp in sorted(hermes_base.glob("installs/*/environments/*/venv/lib/python*/site-packages"), reverse=True):
+        sp_str = str(sp)
+        if sp_str not in sys.path:
+            sys.path.insert(0, sp_str)
+    candidates = [
+        hermes_base / "hermes-agent",
+        Path(os.environ.get("HERMES_HOME", "")) / "hermes-agent" if os.environ.get("HERMES_HOME") else None,
+        Path(os.environ.get("HERMES_HOME", "")).parent.parent / "hermes-agent" if os.environ.get("HERMES_HOME") else None,
+    ]
+    for cand in candidates:
+        if cand and (cand / "hermes_yaml.py").is_file():
+            cand_str = str(cand)
+            if cand_str not in sys.path:
+                sys.path.insert(0, cand_str)
+            try:
+                import hermes_yaml as hy
+                return hy
+            except ImportError:
+                pass
+    return None
+
+
+_hermes_yaml = _bootstrap_hermes_yaml()
 
 try:
     import yaml as _pyyaml
@@ -302,20 +328,30 @@ def _load_yaml_file(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8-sig")
     if not text.strip():
         return {}
+    last_err: Optional[Exception] = None
     if _hermes_yaml is not None:
         try:
             y = _hermes_yaml.YAML(typ="safe")
             data = y.load(text)
-            return dict(data) if isinstance(data, dict) else {}
-        except Exception:
-            pass
+            if data is None:
+                return {}
+            if isinstance(data, dict):
+                return dict(data)
+        except Exception as exc:
+            last_err = exc
     if _pyyaml is not None:
         try:
             data = _pyyaml.safe_load(text)
-            return dict(data) if isinstance(data, dict) else {}
-        except Exception:
-            pass
-    return {}
+            if data is None:
+                return {}
+            if isinstance(data, dict):
+                return dict(data)
+        except Exception as exc:
+            last_err = exc
+    raise RuntimeError(
+        f"Refusing to read non-empty YAML file {path} as empty dict: "
+        f"no working YAML parser in {sys.executable} (last_err={last_err})"
+    )
 
 
 def _dump_yaml_to_string(data: dict[str, Any]) -> str:
@@ -331,7 +367,7 @@ def _dump_yaml_to_string(data: dict[str, Any]) -> str:
             pass
     if _pyyaml is not None:
         return _pyyaml.safe_dump(data, sort_keys=False, allow_unicode=True)
-    return json.dumps(data, indent=2)
+    raise RuntimeError(f"No YAML serializer available in {sys.executable}")
 
 
 def _save_yaml_file(path: Path, mutator) -> dict[str, Any]:
@@ -342,8 +378,11 @@ def _save_yaml_file(path: Path, mutator) -> dict[str, Any]:
             import io
             y = _hermes_yaml.YAML()
             y.preserve_quotes = True
-            doc = y.load(path.read_text(encoding="utf-8-sig")) if path.is_file() else None
+            raw_text = path.read_text(encoding="utf-8-sig") if path.is_file() else ""
+            doc = y.load(raw_text) if raw_text.strip() else {}
             if not isinstance(doc, dict):
+                if raw_text.strip():
+                    raise RuntimeError(f"Unexpected non-mapping root in {path}")
                 doc = {}
             mutator(doc)
             buf = io.StringIO()
@@ -353,7 +392,8 @@ def _save_yaml_file(path: Path, mutator) -> dict[str, Any]:
             tmp.replace(path)
             return _load_yaml_file(path)
         except Exception:
-            pass
+            if _pyyaml is None:
+                raise
     doc = _load_yaml_file(path)
     mutator(doc)
     tmp = path.with_suffix(".yaml.tmp")
@@ -694,13 +734,21 @@ def write_profile_settings(
         if not isinstance(enabled_list, list):
             enabled_list = []
             plugins_sec["enabled"] = enabled_list
+        disabled_list = plugins_sec.get("disabled")
+        if not isinstance(disabled_list, list):
+            disabled_list = []
         has_bb_plugin = any(str(x).strip() in {"platforms/bluebubbles", "bluebubbles-platform"} for x in enabled_list)
         if plugin_enabled and not has_bb_plugin:
             enabled_list.append("platforms/bluebubbles")
         elif not plugin_enabled and has_bb_plugin:
-            plugins_sec["enabled"] = [
+            enabled_list = [
                 x for x in enabled_list if str(x).strip() not in {"platforms/bluebubbles", "bluebubbles-platform"}
             ]
+            plugins_sec["enabled"] = enabled_list
+        if "bluebubbles-extender" not in [str(x).strip() for x in enabled_list] and "bluebubbles-extender" not in [
+            str(x).strip() for x in disabled_list
+        ]:
+            enabled_list.append("bluebubbles-extender")
 
         # 2. platform_toolsets.bluebubbles
         toolsets_sec = doc.setdefault("platform_toolsets", {})
@@ -711,9 +759,10 @@ def write_profile_settings(
             cur_ts = toolsets_sec.get("bluebubbles")
             if not isinstance(cur_ts, list):
                 cur_ts = []
-            for req_ts in ("hermes-bluebubbles", "bluebubbles"):
-                if req_ts not in cur_ts:
-                    cur_ts.append(req_ts)
+            if not cur_ts:
+                cur_ts.extend(["hermes-bluebubbles", "bluebubbles"])
+            elif "bluebubbles" not in cur_ts:
+                cur_ts.append("bluebubbles")
             toolsets_sec["bluebubbles"] = cur_ts
         else:
             if isinstance(toolsets_sec.get("bluebubbles"), list):
