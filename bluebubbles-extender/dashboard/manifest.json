@@ -1,0 +1,14 @@
+{
+  "name": "bluebubbles-extender",
+  "label": "BlueBubbles",
+  "description": "Configuration UI for all BlueBubbles settings, multi-profile DM/group routing, live chat & contact pickers, and Private API status",
+  "icon": "MessageSquare",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/bluebubbles",
+    "position": "after:config"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

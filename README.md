@@ -7,6 +7,7 @@ BlueBubbles iMessage platform plugin (`bluebubbles-platform`) for Hermes Agent. 
 - **Multi-profile DM and group routing.** Differentiates direct message chat GUIDs (`;-;`) from group chat GUIDs (`;+;`) so multiple Hermes profiles can share one BlueBubbles server and only accept or reply to their designated chats.
 - **Webhook hydration, late media, and inbound edits/unsends.** Merges sparse `new-message` and `updated-message` webhook deliveries by message GUID, hydrates missing chat or attachment metadata from `/api/v1/message/<guid>?with=chats,attachments`, forces Private API downloads for offloaded iCloud attachments, retries pending attachments for up to five minutes without replaying admitted text, and delivers user message edits (`dateEdited`) and unsends (`dateRetracted`) with distinct revision keys.
 - **Full BlueBubbles Private API support & agent tools.** Supports Tapback reactions (add & remove), editing and unsending sent messages, iMessage bubble & screen effects, bold subject lines, attachment reply threading, read/unread state, "Notify Anyway" on silenced chats, group chat management (rename, add/remove participants, set/remove group icon, leave group), recipient Focus/DND & iMessage/FaceTime availability checks, and FindMy Friends & Devices lookups (with a native macOS 14+ `FindMyLocateSession` + `MapKit` helper, BlueBubbles `/api/v1/contact` name enrichment, and name/handle filtering).
+- **`bluebubbles-extender` Settings UI plugin.** Ships a companion Hermes plugin (`bluebubbles-extender/`) that adds a **BlueBubbles** tab (`/bluebubbles`) to the Hermes Web Dashboard, a standalone web UI server (`hermes bluebubbles-config serve`), CLI configuration commands (`hermes bluebubbles-config show|set|sync`), and an in-session `/bb-config` slash command — complete with multi-profile switching, live BlueBubbles chat/contact pickers, Private API diagnostics, one-click plugin deployment sync, and gateway restart.
 
 ## Agent Tools (`bluebubbles` toolset)
 
@@ -54,6 +55,38 @@ git -C ~/.hermes/hermes-agent apply patches/hermes-bf0203a-admission-receipts.pa
 
 ```bash
 hermes -p default gateway restart
+```
+
+### Installing the `bluebubbles-extender` Settings UI Plugin
+
+1. Copy `bluebubbles-extender/` into `~/.hermes/plugins/bluebubbles-extender/`:
+
+```bash
+mkdir -p ~/.hermes/plugins/bluebubbles-extender
+rsync -av --delete --exclude="__pycache__" bluebubbles-extender/ \
+  ~/.hermes/plugins/bluebubbles-extender/
+```
+
+2. Enable `bluebubbles-extender` in `~/.hermes/config.yaml` (and in any profile `config.yaml` files you view in the dashboard):
+
+```yaml
+plugins:
+  enabled:
+    - bluebubbles-extender
+```
+
+3. Open the **BlueBubbles** tab in the Hermes Web Dashboard (`/bluebubbles`, e.g. `http://127.0.0.1:9119/bluebubbles`), or run the standalone UI / CLI commands:
+
+```bash
+# Launch standalone Web UI on http://127.0.0.1:8649
+hermes bluebubbles-config serve --host 127.0.0.1 --port 8649
+
+# Show or modify settings for a profile from the CLI
+hermes bluebubbles-config show -p family
+hermes bluebubbles-config set ignore_direct_messages true -p family --restart
+
+# Sync bluebubbles-connector/plugin into all configured profiles
+hermes bluebubbles-config sync --restart
 ```
 
 ### Updating Hermes and the optional `run_busy.py` patch

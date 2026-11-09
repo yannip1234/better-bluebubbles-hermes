@@ -1,0 +1,17 @@
+name: bluebubbles-extender
+label: BlueBubbles Extender
+kind: standalone
+version: 1.0.0
+manifest_version: 2
+description: >
+  Full web UI and CLI configuration interface for all BlueBubbles connector
+  settings across Hermes profiles — server credentials, multi-profile DM (;-;)
+  and group (;+;) chat routing, live chat and contact pickers, wake-word and
+  read-receipt controls, webhook settings, Private API diagnostics, plugin
+  deployment sync, and gateway restart.
+author: Yanni Pang
+provides_tools: []
+provides_hooks: []
+config_keys:
+  - platforms.bluebubbles
+  - platform_toolsets.bluebubbles
