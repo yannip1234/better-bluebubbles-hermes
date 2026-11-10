@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
@@ -78,6 +79,67 @@ _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 _PAGINATION_SUFFIX_RE = re.compile(r"\s*\(\d+/\d+\)$")
 _ADDRESS_RE = re.compile(r"^\+\d+")
+_CLASSIC_TAPBACKS = {"love", "like", "dislike", "laugh", "emphasize", "question"}
+_CLASSIC_TAPBACK_ALIASES = {
+    "❤️": "love",
+    "❤": "love",
+    "👍": "like",
+    "👎": "dislike",
+    "😂": "laugh",
+    "🤣": "laugh",
+    "‼️": "emphasize",
+    "❗": "emphasize",
+    "❓": "question",
+    "?": "question",
+}
+
+
+def _is_emoji_codepoint(cp: int) -> bool:
+    return (
+        0x1F000 <= cp <= 0x1FAFF
+        or 0x2600 <= cp <= 0x27BF
+        or 0x2300 <= cp <= 0x23FF
+        or 0x2B00 <= cp <= 0x2BFF
+        or cp in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D, 0x3297, 0x3299)
+    )
+
+
+def _is_emoji_modifier_or_joiner(cp: int) -> bool:
+    return (
+        cp in (0x200D, 0x20E3, 0xFE0E, 0xFE0F)
+        or 0x1F3FB <= cp <= 0x1F3FF
+        or 0xE0020 <= cp <= 0xE007F
+    )
+
+
+def normalize_tapback_reaction(emoji: Any) -> Optional[str]:
+    """Normalize a classic tapback name/alias or arbitrary single emoji string."""
+    if not isinstance(emoji, str):
+        return None
+    candidate = emoji.strip()
+    if not candidate or len(candidate) > 32 or candidate.startswith("-"):
+        return None
+    if candidate in _CLASSIC_TAPBACK_ALIASES:
+        return _CLASSIC_TAPBACK_ALIASES[candidate]
+    if candidate in _CLASSIC_TAPBACKS:
+        return candidate
+    if any(ch.isspace() or unicodedata.category(ch).startswith("C") and ord(ch) != 0x200D for ch in candidate):
+        return None
+    # Keycap emoji sequences: [0-9#*]\ufe0f?\u20e3
+    if len(candidate) in (2, 3) and candidate[0] in "0123456789#*" and candidate.endswith("\u20e3"):
+        mid = candidate[1:-1]
+        if not mid or mid == "\ufe0f":
+            return candidate
+    has_base_emoji = False
+    for ch in candidate:
+        cp = ord(ch)
+        if _is_emoji_codepoint(cp) or unicodedata.category(ch) == "So":
+            has_base_emoji = True
+        elif _is_emoji_modifier_or_joiner(cp):
+            continue
+        else:
+            return None
+    return candidate if has_base_emoji else None
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
 _LOCAL_HOSTS = {"0.0.0.0", "127.0.0.1", "localhost", "::"}
@@ -917,12 +979,9 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         return {"success": True, "message_id": res.message_id if res.message_id != "ok" else target_id}
 
     async def add_reaction(self, chat_id: str, emoji: str, message_id: Optional[str] = None) -> dict[str, Any]:
-        """Send one of the six native tapbacks using the gateway reaction interface."""
-        aliases = {"❤️": "love", "❤": "love", "👍": "like", "👎": "dislike",
-                   "😂": "laugh", "🤣": "laugh", "‼️": "emphasize", "❗": "emphasize",
-                   "❓": "question", "?": "question"}
-        reaction = aliases.get(emoji, emoji)
-        if reaction not in {"love", "like", "dislike", "laugh", "emphasize", "question"}:
+        """Send one of the six classic tapbacks or an arbitrary emoji tapback via the gateway reaction interface."""
+        reaction = normalize_tapback_reaction(emoji)
+        if not reaction:
             return {"success": False, "error": "Unsupported iMessage tapback"}
         if not message_id:
             return {"success": False, "error": "A message GUID is required"}

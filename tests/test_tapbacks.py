@@ -20,18 +20,23 @@ async def test_add_and_remove_group_tapback():
     a = make_adapter()
     assert (await a.add_reaction("iMessage;+;group", "👍", "message-id"))["success"]
     assert (await a.remove_reaction("iMessage;+;group", "message-id"))["success"]
+    assert (await a.add_reaction("iMessage;+;group", "🦄", "message-id"))["success"]
+    assert (await a.remove_reaction("iMessage;+;group", "message-id"))["success"]
     calls = a._post_message.await_args_list
-    assert [c.args[0] for c in calls] == ["/api/v1/message/react"] * 2
+    assert [c.args[0] for c in calls] == ["/api/v1/message/react"] * 4
     assert [c.args[1] for c in calls] == [
         {"chatGuid": "iMessage;+;group", "selectedMessageGuid": "message-id", "reaction": "like", "partIndex": 0},
-        {"chatGuid": "iMessage;+;group", "selectedMessageGuid": "message-id", "reaction": "-like", "partIndex": 0}]
+        {"chatGuid": "iMessage;+;group", "selectedMessageGuid": "message-id", "reaction": "-like", "partIndex": 0},
+        {"chatGuid": "iMessage;+;group", "selectedMessageGuid": "message-id", "reaction": "🦄", "partIndex": 0},
+        {"chatGuid": "iMessage;+;group", "selectedMessageGuid": "message-id", "reaction": "-🦄", "partIndex": 0}]
 
 
 @pytest.mark.asyncio
 async def test_reaction_fail_closed():
     a = make_adapter()
     assert not (await a.add_reaction("group", "👍"))["success"]
-    assert not (await a.add_reaction("group", "🦄", "id"))["success"]
+    assert not (await a.add_reaction("group", "not-an-emoji", "id"))["success"]
+    assert not (await a.add_reaction("group", "-🔥", "id"))["success"]
     assert not (await a.remove_reaction("group", "id"))["success"]
     a._helper_connected = False
     assert not (await a.add_reaction("group", "like", "id"))["success"]

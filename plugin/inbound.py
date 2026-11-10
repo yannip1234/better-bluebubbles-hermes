@@ -18,7 +18,12 @@ from gateway.platforms.event import MessageEvent, MessageType
 
 logger = logging.getLogger(__name__)
 
-_TAPBACK_CODES = {*range(2000, 2006), *range(3000, 3006)}
+_TAPBACK_CODES = {*range(2000, 2007), *range(3000, 3007)}
+_TAPBACK_STRINGS = {
+    "love", "like", "dislike", "laugh", "emphasize", "question", "emoji",
+    "-love", "-like", "-dislike", "-laugh", "-emphasize", "-question", "-emoji",
+    *(str(c) for c in _TAPBACK_CODES),
+}
 _MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
 _HYDRATE_RETRY_DELAYS = (0.0, 0.05, 0.15)
 _ATTACHMENT_WAIT_SECONDS = 300.0
@@ -647,7 +652,9 @@ class BlueBubblesInboundMixin:
         if record.get("isFromMe") or record.get("fromMe") or record.get("is_from_me"):
             return _ok()
         assoc_type = record.get("associatedMessageType")
-        if isinstance(assoc_type, int) and assoc_type in _TAPBACK_CODES:
+        if (isinstance(assoc_type, int) and assoc_type in _TAPBACK_CODES) or (
+            isinstance(assoc_type, str) and assoc_type.strip().lower() in _TAPBACK_STRINGS
+        ):
             return _ok()
         message_id = self._value(record.get("guid"), record.get("messageGuid"), record.get("id"))
         # A routing-only update can complete a retained message after hydration failed.

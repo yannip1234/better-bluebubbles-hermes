@@ -2,6 +2,8 @@
 import json
 from typing import Any, Callable
 
+from .adapter import normalize_tapback_reaction
+
 _REACTIONS = ("love", "like", "dislike", "laugh", "emphasize", "question")
 _EFFECTS = (
     "slam",
@@ -88,7 +90,10 @@ def _dispatch_adapter_coro(runner: Any, make_coro: Callable[[], Any], error_labe
 
 
 def tapback(args, **_kwargs):
-    if not isinstance(args, dict) or set(args) != {"reaction"} or args["reaction"] not in _REACTIONS:
+    if not isinstance(args, dict) or set(args) != {"reaction"}:
+        return _fail("Supply only one supported reaction.")
+    reaction = normalize_tapback_reaction(args.get("reaction"))
+    if not reaction:
         return _fail("Supply only one supported reaction.")
     ctx, err = _bound_turn_context(require_message=True, action_label="Tapbacks")
     if err:
@@ -96,7 +101,7 @@ def tapback(args, **_kwargs):
     runner, adapter, chat, message = ctx
     return _dispatch_adapter_coro(
         runner,
-        lambda: adapter.add_reaction(chat, args["reaction"], message),
+        lambda: adapter.add_reaction(chat, reaction, message),
         "Tapback dispatch failed",
     )
 
@@ -280,7 +285,8 @@ def lookup(args, **_kwargs):
 def register_tools(ctx):
     tapback_desc = (
         "Add an iMessage Tapback to the current incoming BlueBubbles message only. "
-        "Requires the BlueBubbles Private API helper. Never targets another message or chat."
+        "Supports classic tapbacks (love, like, dislike, laugh, emphasize, question) as well as any emoji "
+        "(e.g. '🔥', '🎉', '🫡', '🦄'). Requires the BlueBubbles Private API helper. Never targets another message or chat."
     )
     ctx.register_tool(
         name="bluebubbles_tapback",
@@ -292,7 +298,15 @@ def register_tools(ctx):
             "description": tapback_desc,
             "parameters": {
                 "type": "object",
-                "properties": {"reaction": {"type": "string", "enum": list(_REACTIONS)}},
+                "properties": {
+                    "reaction": {
+                        "type": "string",
+                        "description": (
+                            "Tapback reaction: one of 'love', 'like', 'dislike', 'laugh', 'emphasize', "
+                            "'question', or any single emoji (e.g. '🔥', '🎉', '🫡', '🦄')."
+                        ),
+                    }
+                },
                 "required": ["reaction"],
                 "additionalProperties": False,
             },

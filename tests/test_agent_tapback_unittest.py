@@ -35,8 +35,13 @@ class ToolRuntimeTest(unittest.TestCase):
             self.assertEqual([call.args[1]["reaction"] for call in adapter._post_message.await_args_list],
                              ["love", "like", "dislike", "laugh", "emphasize", "question"])
             adapter._post_message.reset_mock()
-            for reaction in ("💙", "👍🏽", "👩🏽‍💻", "🇺🇸", "1️⃣", "-💙"):
-                self.assertFalse((await adapter.add_reaction("chat", reaction, "message"))["success"])
+            for reaction in ("💙", "👍🏽", "👩🏽‍💻", "🇺🇸", "1️⃣", "🔥"):
+                self.assertTrue((await adapter.add_reaction("chat", reaction, "message"))["success"])
+            self.assertEqual([call.args[1]["reaction"] for call in adapter._post_message.await_args_list],
+                             ["💙", "👍🏽", "👩🏽‍💻", "🇺🇸", "1️⃣", "🔥"])
+            adapter._post_message.reset_mock()
+            for invalid in ("-💙", "-love", "bad", "hello world", ""):
+                self.assertFalse((await adapter.add_reaction("chat", invalid, "message"))["success"])
             adapter._post_message.assert_not_awaited()
 
         asyncio.run(exercise())
