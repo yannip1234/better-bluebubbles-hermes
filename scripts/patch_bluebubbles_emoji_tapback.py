@@ -53,6 +53,27 @@ def _is_wrapper_dylib(dylib_path: Path) -> bool:
     return "BlueBubblesHelperOrig.dylib" in res.stdout
 
 
+def ensure_writable_app_bundle(app_path: Path) -> None:
+    res_dir = app_path / "Contents" / "Resources"
+    if os.access(res_dir, os.W_OK):
+        return
+    if not os.access(app_path.parent, os.W_OK):
+        raise PermissionError(f"Neither {res_dir} nor {app_path.parent} is writable by current user")
+    print(f"[+] {res_dir} is owned by another user; creating user-owned bundle in {app_path.parent} ...")
+    staged = app_path.with_name(app_path.name + ".staged")
+    orig_bundle = app_path.with_name(app_path.name + ".orig")
+    if staged.exists():
+        shutil.rmtree(staged)
+    subprocess.run(["cp", "-R", str(app_path), str(staged)], check=True)
+    subprocess.run(["chmod", "-R", "u+w,g+w", str(staged)], check=True)
+    if orig_bundle.exists():
+        shutil.rmtree(app_path)
+    else:
+        os.rename(app_path, orig_bundle)
+    os.rename(staged, app_path)
+    print(f"[+] Swapped writable {app_path} into place (backup at {orig_bundle})")
+
+
 def patch_asar(asar_path: Path) -> bool:
     bak_path = asar_path.with_suffix(".asar.bak")
     if not bak_path.exists():
@@ -198,6 +219,7 @@ def main() -> int:
     asar_path = res_dir / "app.asar"
     dylib_dir = res_dir / "appResources" / "private-api" / "macos11"
 
+    ensure_writable_app_bundle(args.app_path)
     patch_asar(asar_path)
     patch_helper_dylib(dylib_dir, source_file)
     print("[+] Done. Restart BlueBubbles.app and Messages.app to load the patched helper.")
