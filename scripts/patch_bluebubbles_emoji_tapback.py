@@ -45,12 +45,12 @@ def _is_wrapper_dylib(dylib_path: Path) -> bool:
     if not dylib_path.exists():
         return False
     res = subprocess.run(
-        ["otool", "-L", str(dylib_path)],
+        ["strings", str(dylib_path)],
         capture_output=True,
         text=True,
         check=False,
     )
-    return "BlueBubblesHelperOrig.dylib" in res.stdout
+    return "Emoji tapback swizzle initialized" in res.stdout
 
 
 def ensure_writable_app_bundle(app_path: Path) -> None:
@@ -160,7 +160,6 @@ def patch_helper_dylib(dylib_dir: Path, source_file: Path) -> None:
         "-fobjc-arc",
         "-framework",
         "Foundation",
-        f"-Wl,-reexport_library,{orig_path}",
         "-install_name",
         str(dylib_path),
         str(source_file),

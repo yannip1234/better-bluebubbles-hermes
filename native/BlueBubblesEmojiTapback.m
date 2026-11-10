@@ -5,6 +5,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <dlfcn.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <os/log.h>
@@ -175,15 +176,29 @@ static void initBlueBubblesEmojiTapbackSwizzle(void) {
     @autoreleasepool {
         os_log_t log = os_log_create("com.bluebubbles.messaging", "DEBUG");
 
-        Class helperMeta = objc_getMetaClass("BlueBubblesHelper");
-        if (helperMeta) {
-            Method parseMethod = class_getClassMethod(objc_getClass("BlueBubblesHelper"),
-                                                      sel_registerName("parseReactionType:"));
+        Dl_info info;
+        NSString *origPath = @"/Applications/BlueBubbles.app/Contents/Resources/appResources/private-api/macos11/BlueBubblesHelperOrig.dylib";
+        if (dladdr((const void *)&initBlueBubblesEmojiTapbackSwizzle, &info) && info.dli_fname) {
+            NSString *selfPath = [NSString stringWithUTF8String:info.dli_fname];
+            NSString *dir = [selfPath stringByDeletingLastPathComponent];
+            if (dir.length > 0) {
+                origPath = [dir stringByAppendingPathComponent:@"BlueBubblesHelperOrig.dylib"];
+            }
+        }
+
+        void *handle = dlopen([origPath fileSystemRepresentation], RTLD_NOW | RTLD_GLOBAL);
+        if (!handle) {
+            os_log_error(log, "BLUEBUBBLESHELPER: Failed to dlopen %{public}@: %{public}s", origPath, dlerror());
+            return;
+        }
+
+        Class helperCls = objc_getClass("BlueBubblesHelper");
+        if (helperCls) {
+            Method parseMethod = class_getClassMethod(helperCls, sel_registerName("parseReactionType:"));
             if (parseMethod) {
                 g_origParseReactionType = method_setImplementation(parseMethod, (IMP)swizzled_parseReactionType);
             }
-            Method verbMethod = class_getClassMethod(objc_getClass("BlueBubblesHelper"),
-                                                     sel_registerName("reactionToVerb:"));
+            Method verbMethod = class_getClassMethod(helperCls, sel_registerName("reactionToVerb:"));
             if (verbMethod) {
                 g_origReactionToVerb = method_setImplementation(verbMethod, (IMP)swizzled_reactionToVerb);
             }
