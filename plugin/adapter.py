@@ -675,6 +675,25 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         with suppress(Exception):
             await self.add_reaction(chat_id, emoji, message_id, _auto_status=True)
 
+    async def _await_tapback_removal_delivery(self, reaction_msg_id: Optional[str]) -> None:
+        """Wait for imagent to commit and deliver a tapback-removal row before sending the final edit."""
+        msg_guid = (reaction_msg_id or "").strip()
+        if not msg_guid or msg_guid == "ok" or not self.client:
+            return
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            try:
+                res = await self._api_get(f"/api/v1/message/{quote(msg_guid, safe='')}")
+                data = res.get("data") if isinstance(res, dict) else None
+                if not isinstance(data, dict):
+                    return
+                if data.get("isDelivered") or data.get("dateDelivered"):
+                    await asyncio.sleep(0.15)
+                    return
+            except Exception:
+                return
+            await asyncio.sleep(0.15)
+
     async def _clear_turn_status_tapback(self, turn_key: str, chat_id: Optional[str]) -> None:
         self._cancel_turn_thinking_tapback_task(turn_key)
         status_tb = self._turn_status_tapbacks.pop(turn_key, None)
@@ -687,7 +706,9 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             and self._helper_connected
         ):
             with suppress(Exception):
-                await self.remove_reaction(chat_id, status_tb[0])
+                rem = await self.remove_reaction(chat_id, status_tb[0])
+                if isinstance(rem, dict) and rem.get("success"):
+                    await self._await_tapback_removal_delivery(rem.get("message_id"))
 
     async def _process_message_background(self, event, session_key):
         # Core debounce/queue merges update event.message_id, not source.message_id.
@@ -1794,6 +1815,8 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         turn_key = _turn_chat_key(chat_id) or _turn_chat_key(guid)
         if turn_key and turn_key in self._active_turn_chats:
             self._cancel_turn_placeholder_task(turn_key)
+            if finalize:
+                await self._clear_turn_status_tapback(turn_key, chat_id)
         active_prog_id = self._turn_progress_bubbles.get(turn_key) if turn_key else None
         is_progress_bubble = bool(
             active_prog_id and (active_prog_id == target_id or self._follow_replaced_message_id(active_prog_id) == live_id)
