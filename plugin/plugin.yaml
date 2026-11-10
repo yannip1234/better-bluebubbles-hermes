@@ -7,6 +7,9 @@ provides_tools:
   - bluebubbles_edit_message
   - bluebubbles_unsend_message
   - bluebubbles_send_effect
+  - bluebubbles_send_later
+  - bluebubbles_poll
+  - bluebubbles_sticker
   - bluebubbles_chat_action
   - bluebubbles_lookup
 version: 1.0.0

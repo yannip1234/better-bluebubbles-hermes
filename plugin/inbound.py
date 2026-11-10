@@ -1,9 +1,11 @@
 """BlueBubbles webhook hydration, routing, and admission ownership."""
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
+import plistlib
 import re
 import time
 from copy import deepcopy
@@ -18,12 +20,14 @@ from gateway.platforms.event import MessageEvent, MessageType
 
 logger = logging.getLogger(__name__)
 
-_TAPBACK_CODES = {*range(2000, 2007), *range(3000, 3007)}
+_TAPBACK_CODES = {*range(2000, 2008), *range(3000, 3008)}
 _TAPBACK_STRINGS = {
-    "love", "like", "dislike", "laugh", "emphasize", "question", "emoji",
-    "-love", "-like", "-dislike", "-laugh", "-emphasize", "-question", "-emoji",
+    "love", "like", "dislike", "laugh", "emphasize", "question", "emoji", "sticker",
+    "-love", "-like", "-dislike", "-laugh", "-emphasize", "-question", "-emoji", "-sticker",
     *(str(c) for c in _TAPBACK_CODES),
 }
+_POLL_BUNDLE_SUBSTR = "com.apple.messages.polls"
+_DATA_URL_B64_RE = re.compile(rb"data:,([A-Za-z0-9+/=_-]+)")
 _MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
 _HYDRATE_RETRY_DELAYS = (0.0, 0.05, 0.15)
 _ATTACHMENT_WAIT_SECONDS = 300.0
@@ -58,6 +62,109 @@ def _user_attachments(record: dict[str, Any]) -> list[dict[str, Any]]:
         att for att in (record.get("attachments") or [])
         if isinstance(att, dict) and not _is_ignored_attachment(att)
     ]
+
+
+def _is_poll_record(record: dict[str, Any]) -> bool:
+    bundle_id = str(record.get("balloonBundleId") or record.get("balloon_bundle_id") or "").strip().lower()
+    return _POLL_BUNDLE_SUBSTR in bundle_id
+
+
+def _extract_poll_json_from_payload_data(raw_payload: Any) -> Optional[dict[str, Any]]:
+    if not raw_payload:
+        return None
+    raw_bytes: Optional[bytes] = None
+    if isinstance(raw_payload, bytes):
+        raw_bytes = raw_payload
+    elif isinstance(raw_payload, str):
+        s = raw_payload.strip()
+        if s.startswith("data:,"):
+            with suppress(Exception):
+                return json.loads(base64.b64decode(s[6:]))
+        with suppress(Exception):
+            raw_bytes = base64.b64decode(s)
+        if not raw_bytes:
+            raw_bytes = s.encode("utf-8", errors="ignore")
+    elif isinstance(raw_payload, dict):
+        if raw_payload.get("type") == "Buffer" and isinstance(raw_payload.get("data"), list):
+            with suppress(Exception):
+                raw_bytes = bytes(int(b) & 0xFF for b in raw_payload["data"])
+        elif "item" in raw_payload and isinstance(raw_payload.get("item"), dict):
+            return raw_payload
+        else:
+            raw_bytes = json.dumps(raw_payload).encode("utf-8", errors="ignore")
+    elif isinstance(raw_payload, list):
+        for entry in raw_payload:
+            parsed = _extract_poll_json_from_payload_data(entry)
+            if parsed:
+                return parsed
+        return None
+
+    if not raw_bytes:
+        return None
+
+    # 1. Direct scan for embedded `data:,<base64>` inside NSKeyedArchiver bplist00 or JSON
+    for match in _DATA_URL_B64_RE.finditer(raw_bytes):
+        b64_chunk = match.group(1)
+        with suppress(Exception):
+            decoded = base64.b64decode(b64_chunk)
+            obj = json.loads(decoded.decode("utf-8"))
+            if isinstance(obj, dict) and isinstance(obj.get("item"), dict):
+                return obj
+
+    # 2. Fallback: plistlib load and recursive string scan
+    with suppress(Exception):
+        plist_obj = plistlib.loads(raw_bytes)
+        text_dump = json.dumps(plist_obj, default=str).encode("utf-8", errors="ignore")
+        for match in _DATA_URL_B64_RE.finditer(text_dump):
+            with suppress(Exception):
+                decoded = base64.b64decode(match.group(1))
+                obj = json.loads(decoded.decode("utf-8"))
+                if isinstance(obj, dict) and isinstance(obj.get("item"), dict):
+                    return obj
+    return None
+
+
+def _format_poll_message(record: dict[str, Any]) -> Optional[str]:
+    if not _is_poll_record(record):
+        return None
+    msg_guid = str(record.get("guid") or record.get("messageGuid") or "").strip()
+    assoc_guid = str(record.get("associatedMessageGuid") or "").strip()
+    if assoc_guid.startswith("bp:") or assoc_guid.startswith("p:0/"):
+        assoc_guid = assoc_guid.split(":", 1)[-1].split("/", 1)[-1]
+
+    poll_obj = _extract_poll_json_from_payload_data(record.get("payloadData"))
+    if isinstance(poll_obj, dict) and isinstance(poll_obj.get("item"), dict):
+        item = poll_obj["item"]
+        options = item.get("orderedPollOptions")
+        if isinstance(options, list) and options:
+            title = str(item.get("title") or "").strip() or "Untitled Poll"
+            opt_parts = []
+            for idx, opt in enumerate(options, start=1):
+                if not isinstance(opt, dict):
+                    continue
+                opt_text = str(opt.get("text") or "").strip()
+                opt_id = str(opt.get("optionIdentifier") or "").strip()
+                if opt_text:
+                    opt_parts.append(f"{idx}. {opt_text}" + (f" (id={opt_id})" if opt_id else ""))
+            target_id = assoc_guid or msg_guid
+            id_Tag = f" (poll_id={target_id})" if target_id else ""
+            return f'[Poll: "{title}"{id_Tag}] Options: ' + "; ".join(opt_parts)
+        votes = item.get("votes")
+        if isinstance(votes, list) and votes:
+            vote_ids = [
+                str(v.get("voteOptionIdentifier") or "").strip()
+                for v in votes
+                if isinstance(v, dict) and v.get("voteOptionIdentifier")
+            ]
+            target_id = assoc_guid or msg_guid
+            id_tag = f" on poll {target_id}" if target_id else ""
+            return f"[Poll vote{id_tag}]: option(s) {', '.join(vote_ids)}"
+
+    raw_text = str(record.get("text") or record.get("message") or record.get("body") or "").replace("\ufffc", "").strip()
+    target_id = assoc_guid or msg_guid
+    if raw_text:
+        return f"[Poll{f' (poll_id={target_id})' if target_id else ''}]: {raw_text}"
+    return f"[Poll{f' (poll_id={target_id})' if target_id else ''}]"
 
 
 def _chat_guid_delimiter(value: Optional[str]) -> Optional[str]:
@@ -340,6 +447,8 @@ class BlueBubblesInboundMixin:
         # Receipt snapshots can also carry previously unseen content and completed attachments.
         if cls._extract_retracted_ts(record) > 0 or cls._extract_edited_ts(record) > 0:
             return False
+        if _is_poll_record(record):
+            return False
         return (event_type == "updated-message"
                 and not (any(record.get(key) for key in ("text", "message", "body")) or _user_attachments(record)))
 
@@ -348,7 +457,11 @@ class BlueBubblesInboundMixin:
         if state is None:
             return False
         if not state.accepted:
-            return any(state.record.get(key) for key in ("text", "message", "body")) or bool(_user_attachments(state.record))
+            return (
+                any(state.record.get(key) for key in ("text", "message", "body"))
+                or bool(_user_attachments(state.record))
+                or _is_poll_record(state.record)
+            )
         return any(isinstance(att, dict) and att.get("guid") and att["guid"] not in state.delivered
                    for att in _user_attachments(state.record))
 
@@ -541,7 +654,12 @@ class BlueBubblesInboundMixin:
         edited_ts = self._extract_edited_ts(record)
         pending_unsend = state.accepted and retracted_ts > 0 and not state.retracted
         pending_edit = state.accepted and not pending_unsend and edited_ts > state.last_edit_ts
-        text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
+        text = (self._value(record.get("text"), record.get("message"), record.get("body")) or "").replace("\ufffc", "").strip()
+        if _is_poll_record(record) and not record.get("payloadData") and self.client:
+            with suppress(httpx.HTTPError, OSError, ValueError, TimeoutError):
+                self._merge_inbound_record(record, await self._hydrate_inbound_record(message_id))
+        if poll_summary := _format_poll_message(record):
+            text = poll_summary
         # Known unmentioned group text needs no media I/O; sparse text can still hydrate below.
         if is_group and self.require_mention and not pending_unsend and text and not self._message_matches_mention_patterns(text):
             return _ok()
@@ -554,7 +672,9 @@ class BlueBubblesInboundMixin:
                     self._merge_inbound_record(record, await self._hydrate_inbound_record(message_id))
             except (httpx.HTTPError, OSError, ValueError, TimeoutError) as exc:
                 logger.warning("[bluebubbles] attachment hydration failed: %s", type(exc).__name__)
-        text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
+        text = (self._value(record.get("text"), record.get("message"), record.get("body")) or "").replace("\ufffc", "").strip()
+        if poll_summary := _format_poll_message(record):
+            text = poll_summary
         if is_group and self.require_mention:
             if not pending_unsend and not self._message_matches_mention_patterns(text):
                 return _ok()

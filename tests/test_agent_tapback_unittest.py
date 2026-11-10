@@ -14,8 +14,11 @@ from plugin.tools import (
     chat_action,
     edit_message,
     lookup,
+    poll,
     remove_tapback,
     send_effect,
+    send_later,
+    sticker,
     tapback,
     unsend_message,
 )
@@ -241,6 +244,139 @@ class ToolRuntimeTest(unittest.TestCase):
                 self.assertTrue(res_friends["success"])
                 res_devices = json.loads(lookup({"query": "findmy_devices"}))
                 self.assertTrue(res_devices["success"])
+
+                # 8. Text formatting & animated text effects via send_effect
+                res_fmt = json.loads(
+                    send_effect(
+                        {
+                            "text": "Hello Bold Explode!",
+                            "styles": ["bold", "italic"],
+                            "text_effect": "explode",
+                            "ranges": [
+                                {"start": 0, "length": 5, "styles": ["underline"], "text_effect": "ripple"}
+                            ],
+                        }
+                    )
+                )
+                self.assertTrue(res_fmt["success"])
+                fmt_call = adapter._post_message.await_args_list[-1]
+                self.assertEqual(fmt_call.args[0], "/api/v1/message/text")
+                self.assertTrue(fmt_call.args[1]["effectId"].startswith("__bb_custom:"))
+                fmt_spec = json.loads(fmt_call.args[1]["effectId"][len("__bb_custom:"):])
+                self.assertEqual(fmt_spec["type"], "styled_text")
+                self.assertEqual(fmt_spec["styles"], ["bold", "italic"])
+                self.assertEqual(fmt_spec["text_effect"], 12)
+                self.assertEqual(fmt_spec["ranges"][0]["text_effect"], 1)
+
+                # 9. Send Later
+                res_later = json.loads(
+                    send_later(
+                        {
+                            "text": "Reminder in 5m",
+                            "delay_seconds": 300,
+                            "styles": ["bold"],
+                        }
+                    )
+                )
+                self.assertTrue(res_later["success"])
+                later_call = adapter._post_message.await_args_list[-1]
+                later_spec = json.loads(later_call.args[1]["effectId"][len("__bb_custom:"):])
+                self.assertEqual(later_spec["type"], "send_later")
+                self.assertEqual(later_spec["styles"], ["bold"])
+                self.assertGreater(later_spec["scheduled_at_ms"], 1000000000000)
+
+                # Past date must fail validation
+                self.assertFalse(
+                    json.loads(send_later({"text": "past", "send_at": 1000000000}))["success"]
+                )
+
+                # 10. Native iMessage Polls (create, vote, add_option)
+                res_poll = json.loads(
+                    poll(
+                        {
+                            "action": "create",
+                            "title": "Dinner tonight?",
+                            "options": ["Tacos", "Sushi", "Pizza"],
+                        }
+                    )
+                )
+                self.assertTrue(res_poll["success"])
+                self.assertEqual(len(res_poll["options"]), 3)
+                poll_call = adapter._post_message.await_args_list[-1]
+                poll_spec = json.loads(poll_call.args[1]["effectId"][len("__bb_custom:"):])
+                self.assertEqual(poll_spec["type"], "poll_create")
+                self.assertEqual(poll_spec["title"], "Dinner tonight?")
+
+                first_opt_id = res_poll["options"][0]["identifier"]
+                res_vote = json.loads(
+                    poll(
+                        {
+                            "action": "vote",
+                            "poll_message_guid": "poll-guid-1",
+                            "option_id": first_opt_id,
+                            "option_text": "Tacos",
+                        }
+                    )
+                )
+                self.assertTrue(res_vote["success"])
+                vote_spec = json.loads(
+                    adapter._post_message.await_args_list[-1].args[1]["effectId"][len("__bb_custom:"):]
+                )
+                self.assertEqual(vote_spec["type"], "poll_vote")
+                self.assertEqual(vote_spec["poll_guid"], "poll-guid-1")
+
+                res_add_opt = json.loads(
+                    poll(
+                        {
+                            "action": "add_option",
+                            "poll_message_guid": "poll-guid-1",
+                            "option_text": "Ramen",
+                        }
+                    )
+                )
+                self.assertTrue(res_add_opt["success"])
+                add_opt_spec = json.loads(
+                    adapter._post_message.await_args_list[-1].args[1]["effectId"][len("__bb_custom:"):]
+                )
+                self.assertEqual(add_opt_spec["type"], "poll_add_option")
+                self.assertEqual(add_opt_spec["text"], "Ramen")
+
+                # 11. Sticker tapbacks, freeform overlay, and standalone stickers
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".png") as tmp_sticker:
+                    tmp_sticker.write(b"\x89PNG\r\n\x1a\n")
+                    tmp_sticker.flush()
+
+                    res_st_tapback = json.loads(
+                        sticker({"mode": "tapback", "file_path": tmp_sticker.name})
+                    )
+                    self.assertTrue(res_st_tapback["success"])
+                    st_tb_spec = json.loads(
+                        adapter._post_message.await_args_list[-1].args[1]["effectId"][len("__bb_custom:"):]
+                    )
+                    self.assertEqual(st_tb_spec["type"], "sticker_send")
+                    self.assertEqual(st_tb_spec["mode"], "tapback")
+                    self.assertEqual(st_tb_spec["selected_guid"], "inbound-msg-1")
+
+                    res_st_overlay = json.loads(
+                        sticker(
+                            {
+                                "mode": "overlay",
+                                "file_path": tmp_sticker.name,
+                                "x": 0.35,
+                                "y": 0.65,
+                                "scale": 1.2,
+                                "rotation": 15.0,
+                            }
+                        )
+                    )
+                    self.assertTrue(res_st_overlay["success"])
+                    st_ov_spec = json.loads(
+                        adapter._post_message.await_args_list[-1].args[1]["effectId"][len("__bb_custom:"):]
+                    )
+                    self.assertEqual(st_ov_spec["mode"], "overlay")
+                    self.assertAlmostEqual(st_ov_spec["x_scalar"], 0.35)
+                    self.assertAlmostEqual(st_ov_spec["y_scalar"], 0.65)
             finally:
                 sc.clear_session_vars(tokens)
 

@@ -2,7 +2,13 @@
 import json
 from typing import Any, Callable
 
-from .adapter import normalize_tapback_reaction
+from .adapter import (
+    _normalize_text_ranges,
+    _normalize_text_styles,
+    _parse_send_at_timestamp,
+    _resolve_text_effect,
+    normalize_tapback_reaction,
+)
 
 _REACTIONS = ("love", "like", "dislike", "laugh", "emphasize", "question")
 _EFFECTS = (
@@ -20,6 +26,23 @@ _EFFECTS = (
     "echo",
     "spotlight",
 )
+_TEXT_EFFECTS = (
+    "big",
+    "small",
+    "shake",
+    "nod",
+    "explode",
+    "ripple",
+    "bloom",
+    "jitter",
+    "bounce",
+    "stretch",
+    "squish",
+    "somersault",
+)
+_TEXT_STYLES = ("bold", "italic", "underline", "strikethrough")
+_POLL_ACTIONS = ("create", "vote", "add_option")
+_STICKER_MODES = ("tapback", "remove_tapback", "overlay", "standalone")
 _CHAT_ACTIONS = (
     "mark_read",
     "mark_unread",
@@ -161,28 +184,218 @@ def unsend_message(args, **_kwargs):
 
 
 def send_effect(args, **_kwargs):
-    allowed = {"text", "effect", "subject", "reply_to_current"}
+    allowed = {"text", "effect", "text_effect", "styles", "ranges", "subject", "reply_to_current"}
     if not isinstance(args, dict) or not set(args).issubset(allowed):
         return _fail("Unsupported arguments for bluebubbles_send_effect.")
     text = str(args.get("text") or "").strip()
     effect = args.get("effect")
+    text_effect = args.get("text_effect")
+    styles = args.get("styles")
+    ranges = args.get("ranges")
     subject = str(args.get("subject") or "").strip() or None
     if effect is not None and effect not in _EFFECTS:
         return _fail(f"Unsupported effect. Choose one of: {', '.join(_EFFECTS)}")
+    if text_effect is not None and not _resolve_text_effect(text_effect):
+        return _fail(f"Unsupported text_effect. Choose one of: {', '.join(_TEXT_EFFECTS)}")
+    norm_styles = _normalize_text_styles(styles)
+    if norm_styles is None:
+        return _fail(f"Unsupported styles. Choose from: {', '.join(_TEXT_STYLES)}")
+    norm_ranges = _normalize_text_ranges(ranges)
+    if norm_ranges is None:
+        return _fail("Invalid 'ranges' specification.")
     if not text and not subject:
         return _fail("Provide 'text' and/or 'subject'.")
-    if not effect and not subject:
-        return _fail("Provide 'effect' and/or 'subject'.")
+    if not any((effect, text_effect, norm_styles, norm_ranges, subject)):
+        return _fail("Provide 'effect', 'text_effect', 'styles', 'ranges', and/or 'subject'.")
     reply_to_current = bool(args.get("reply_to_current", False))
     ctx, err = _bound_turn_context(require_message=reply_to_current, action_label="Sending with effect")
     if err:
         return _fail(err)
     runner, adapter, chat, message = ctx
     reply_to = message if reply_to_current else None
+    if norm_styles or norm_ranges or text_effect:
+        return _dispatch_adapter_coro(
+            runner,
+            lambda: adapter.send_effect(
+                chat,
+                text,
+                effect=effect,
+                text_effect=text_effect,
+                styles=norm_styles,
+                ranges=norm_ranges,
+                subject=subject,
+                reply_to=reply_to,
+            ),
+            "Send effect dispatch failed",
+        )
     return _dispatch_adapter_coro(
         runner,
         lambda: adapter.send_effect(chat, text, effect=effect, subject=subject, reply_to=reply_to),
         "Send effect dispatch failed",
+    )
+
+
+def send_later(args, **_kwargs):
+    allowed = {
+        "text",
+        "send_at",
+        "delay_seconds",
+        "subject",
+        "effect",
+        "text_effect",
+        "styles",
+        "ranges",
+        "reply_to_current",
+    }
+    if not isinstance(args, dict) or not set(args).issubset(allowed):
+        return _fail("Unsupported arguments for bluebubbles_send_later.")
+    text = str(args.get("text") or "").strip()
+    if not text:
+        return _fail("A non-empty 'text' string is required.")
+    send_at = args.get("send_at")
+    delay_seconds = args.get("delay_seconds")
+    if _parse_send_at_timestamp(send_at=send_at, delay_seconds=delay_seconds) is None:
+        return _fail("Provide a future 'send_at' timestamp/ISO-8601 datetime or positive 'delay_seconds'.")
+    effect = args.get("effect")
+    if effect is not None and effect not in _EFFECTS:
+        return _fail(f"Unsupported effect. Choose one of: {', '.join(_EFFECTS)}")
+    text_effect = args.get("text_effect")
+    if text_effect is not None and not _resolve_text_effect(text_effect):
+        return _fail(f"Unsupported text_effect. Choose one of: {', '.join(_TEXT_EFFECTS)}")
+    norm_styles = _normalize_text_styles(args.get("styles"))
+    if norm_styles is None:
+        return _fail(f"Unsupported styles. Choose from: {', '.join(_TEXT_STYLES)}")
+    norm_ranges = _normalize_text_ranges(args.get("ranges"))
+    if norm_ranges is None:
+        return _fail("Invalid 'ranges' specification.")
+    subject = str(args.get("subject") or "").strip() or None
+    reply_to_current = bool(args.get("reply_to_current", False))
+    ctx, err = _bound_turn_context(require_message=reply_to_current, action_label="Scheduling a message")
+    if err:
+        return _fail(err)
+    runner, adapter, chat, message = ctx
+    reply_to = message if reply_to_current else None
+    return _dispatch_adapter_coro(
+        runner,
+        lambda: adapter.send_later(
+            chat,
+            text,
+            send_at=send_at,
+            delay_seconds=delay_seconds,
+            subject=subject,
+            effect=effect,
+            text_effect=text_effect,
+            styles=norm_styles,
+            ranges=norm_ranges,
+            reply_to=reply_to,
+        ),
+        "Send later dispatch failed",
+    )
+
+
+def poll(args, **_kwargs):
+    allowed = {"action", "title", "options", "option", "message_id", "reply_to_current"}
+    if not isinstance(args, dict) or not set(args).issubset(allowed):
+        return _fail("Unsupported arguments for bluebubbles_poll.")
+    action = str(args.get("action") or "create").strip().lower()
+    if action not in _POLL_ACTIONS:
+        return _fail(f"Unsupported poll action. Choose one of: {', '.join(_POLL_ACTIONS)}")
+    reply_to_current = bool(args.get("reply_to_current", False))
+    require_msg = reply_to_current or (action in ("vote", "add_option") and not (args.get("message_id") or "").strip())
+    ctx, err = _bound_turn_context(require_message=require_msg, action_label="iMessage Poll")
+    if err:
+        return _fail(err)
+    runner, adapter, chat, message = ctx
+
+    if action == "create":
+        title = str(args.get("title") or "").strip()
+        options = args.get("options")
+        if not isinstance(options, list) or len(options) < 2:
+            return _fail("'options' must be a list of at least 2 poll choices.")
+        reply_to = message if reply_to_current else None
+        return _dispatch_adapter_coro(
+            runner,
+            lambda: adapter.send_poll(chat, title, options, reply_to=reply_to),
+            "Poll creation failed",
+        )
+
+    target_poll = str(args.get("message_id") or "").strip() or message or "last"
+    if action == "vote":
+        option = args.get("option") if "option" in args else args.get("options")
+        if option is None or option == "" or option == []:
+            return _fail("'option' is required when action is 'vote'.")
+        return _dispatch_adapter_coro(
+            runner,
+            lambda: adapter.vote_poll(chat, target_poll, option),
+            "Poll vote failed",
+        )
+
+    opt_text = str(args.get("option") or "").strip()
+    if not opt_text:
+        return _fail("A non-empty 'option' string is required when action is 'add_option'.")
+    return _dispatch_adapter_coro(
+        runner,
+        lambda: adapter.add_poll_option(chat, target_poll, opt_text),
+        "Poll add_option failed",
+    )
+
+
+def sticker(args, **_kwargs):
+    allowed = {
+        "file_path",
+        "mode",
+        "message_id",
+        "x_scalar",
+        "y_scalar",
+        "scale",
+        "rotation",
+        "part_index",
+    }
+    if not isinstance(args, dict) or not set(args).issubset(allowed):
+        return _fail("Unsupported arguments for bluebubbles_sticker.")
+    file_path = str(args.get("file_path") or "").strip()
+    if not file_path:
+        return _fail("A non-empty 'file_path' is required.")
+    mode = str(args.get("mode") or "tapback").strip().lower()
+    if mode not in _STICKER_MODES:
+        return _fail(f"Unsupported sticker mode. Choose one of: {', '.join(_STICKER_MODES)}")
+    part_index = args.get("part_index", 0)
+    if not isinstance(part_index, int) or isinstance(part_index, bool) or part_index < 0:
+        return _fail("'part_index' must be a non-negative integer.")
+    try:
+        x_scalar = float(args.get("x_scalar", 0.0))
+        y_scalar = float(args.get("y_scalar", 0.0))
+        scale = float(args.get("scale", 1.0))
+        rotation = float(args.get("rotation", 0.0))
+    except (TypeError, ValueError):
+        return _fail("Sticker coordinates/scale/rotation must be numbers.")
+    if scale <= 0:
+        return _fail("'scale' must be positive.")
+
+    explicit_msg = str(args.get("message_id") or "").strip()
+    require_msg = mode in ("tapback", "remove_tapback", "overlay") and not explicit_msg
+    ctx, err = _bound_turn_context(require_message=require_msg, action_label="Sending a sticker")
+    if err:
+        return _fail(err)
+    runner, adapter, chat, message = ctx
+    target_msg = None if mode == "standalone" else (explicit_msg or message)
+    is_tapback = mode in ("tapback", "remove_tapback")
+    is_remove = mode == "remove_tapback"
+    return _dispatch_adapter_coro(
+        runner,
+        lambda: adapter.send_sticker(
+            chat,
+            file_path,
+            reply_to=target_msg,
+            tapback=is_tapback,
+            remove=is_remove,
+            x_scalar=x_scalar,
+            y_scalar=y_scalar,
+            scale=scale,
+            rotation=rotation,
+            part_index=part_index,
+        ),
+        "Sticker dispatch failed",
     )
 
 
@@ -401,7 +614,9 @@ def register_tools(ctx):
     effect_desc = (
         "Send an iMessage in the current BlueBubbles chat with an expressive bubble effect (slam, loud, gentle, "
         "invisible), full-screen effect (balloons, confetti, lasers, fireworks, shooting-star, celebration, love, "
-        "echo, spotlight), and/or a bold subject line. Requires the Private API helper."
+        "echo, spotlight), inline text formatting (bold, italic, underline, strikethrough), animated text effect "
+        "(big, small, shake, nod, explode, ripple, bloom, jitter, bounce, stretch, squish, somersault), range-based "
+        "formatting, and/or a bold subject line. Requires the Private API helper."
     )
     ctx.register_tool(
         name="bluebubbles_send_effect",
@@ -420,6 +635,34 @@ def register_tools(ctx):
                         "enum": list(_EFFECTS),
                         "description": "Bubble or full-screen iMessage effect.",
                     },
+                    "text_effect": {
+                        "type": "string",
+                        "enum": list(_TEXT_EFFECTS),
+                        "description": "Animated iMessage text effect applied to the message text.",
+                    },
+                    "styles": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": list(_TEXT_STYLES)},
+                        "description": "Inline text styles applied to the message text (bold, italic, underline, strikethrough).",
+                    },
+                    "ranges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "start": {"type": "integer", "description": "0-based character start offset."},
+                                "length": {"type": "integer", "description": "Character span length (> 0)."},
+                                "styles": {
+                                    "type": "array",
+                                    "items": {"type": "string", "enum": list(_TEXT_STYLES)},
+                                },
+                                "text_effect": {"type": "string", "enum": list(_TEXT_EFFECTS)},
+                            },
+                            "required": ["start", "length"],
+                            "additionalProperties": False,
+                        },
+                        "description": "Optional character sub-ranges with specific inline styles or animated text effects.",
+                    },
                     "subject": {
                         "type": "string",
                         "description": "Optional bold iMessage subject header.",
@@ -429,6 +672,156 @@ def register_tools(ctx):
                         "description": "Whether to thread the message as an inline reply to the current incoming message.",
                     },
                 },
+                "additionalProperties": False,
+            },
+        },
+    )
+
+    send_later_desc = (
+        "Schedule a native iMessage ('Send Later') in the current BlueBubbles chat for future delivery. "
+        "Provide either 'send_at' (ISO-8601 datetime string or Unix timestamp) or 'delay_seconds' (seconds from now). "
+        "Requires the Private API helper."
+    )
+    ctx.register_tool(
+        name="bluebubbles_send_later",
+        toolset="bluebubbles",
+        handler=send_later,
+        description=send_later_desc,
+        schema={
+            "name": "bluebubbles_send_later",
+            "description": send_later_desc,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Message body text to schedule."},
+                    "send_at": {
+                        "type": "string",
+                        "description": "Future ISO-8601 timestamp (e.g. '2026-11-10T18:30:00-05:00') or Unix epoch seconds.",
+                    },
+                    "delay_seconds": {
+                        "type": "number",
+                        "description": "Alternative to send_at: positive number of seconds from now to deliver the message.",
+                    },
+                    "subject": {"type": "string", "description": "Optional bold iMessage subject header."},
+                    "effect": {"type": "string", "enum": list(_EFFECTS)},
+                    "text_effect": {"type": "string", "enum": list(_TEXT_EFFECTS)},
+                    "styles": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": list(_TEXT_STYLES)},
+                    },
+                    "reply_to_current": {
+                        "type": "boolean",
+                        "description": "Whether to thread the scheduled message as an inline reply to the current incoming message.",
+                    },
+                },
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+        },
+    )
+
+    poll_desc = (
+        "Create a native iMessage Poll ('create'), vote on an existing Poll ('vote'), or add a new choice "
+        "to an existing Poll ('add_option') in the current BlueBubbles chat. Requires the Private API helper."
+    )
+    ctx.register_tool(
+        name="bluebubbles_poll",
+        toolset="bluebubbles",
+        handler=poll,
+        description=poll_desc,
+        schema={
+            "name": "bluebubbles_poll",
+            "description": poll_desc,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": list(_POLL_ACTIONS),
+                        "description": "Poll operation: 'create', 'vote', or 'add_option'.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Poll question/title when action is 'create'.",
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of 2 to 12 poll option strings when action is 'create'.",
+                    },
+                    "option": {
+                        "type": "string",
+                        "description": (
+                            "When action is 'vote', the option text, 1-based option number ('1', '2', ...), or option UUID "
+                            "to vote for. When action is 'add_option', the new option text to add."
+                        ),
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Target poll message GUID for 'vote' or 'add_option' (defaults to current incoming message or last poll).",
+                    },
+                    "reply_to_current": {
+                        "type": "boolean",
+                        "description": "Whether to thread a newly created poll as an inline reply to the current incoming message.",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": False,
+            },
+        },
+    )
+
+    sticker_desc = (
+        "Send an image file as an iMessage Sticker Tapback ('tapback' / 'remove_tapback'), a freeform "
+        "sticker placed onto a message bubble ('overlay' with optional x_scalar, y_scalar, scale, rotation), "
+        "or a standalone sticker ('standalone') in the current BlueBubbles chat. Requires the Private API helper."
+    )
+    ctx.register_tool(
+        name="bluebubbles_sticker",
+        toolset="bluebubbles",
+        handler=sticker,
+        description=sticker_desc,
+        schema={
+            "name": "bluebubbles_sticker",
+            "description": sticker_desc,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Local file path to the sticker image (.png, .heic, .gif, .webp, .jpg).",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": list(_STICKER_MODES),
+                        "description": "Sticker mode: 'tapback' (default), 'remove_tapback', 'overlay' (freeform on message), or 'standalone'.",
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Optional target message GUID for 'tapback', 'remove_tapback', or 'overlay' (defaults to current incoming message).",
+                    },
+                    "x_scalar": {
+                        "type": "number",
+                        "description": "Normalized horizontal placement offset (0.0 = center) for 'overlay'.",
+                    },
+                    "y_scalar": {
+                        "type": "number",
+                        "description": "Normalized vertical placement offset (0.0 = center) for 'overlay'.",
+                    },
+                    "scale": {
+                        "type": "number",
+                        "description": "Sticker scale factor (default 1.0).",
+                    },
+                    "rotation": {
+                        "type": "number",
+                        "description": "Sticker rotation in radians (default 0.0).",
+                    },
+                    "part_index": {
+                        "type": "integer",
+                        "description": "Target message part index (default 0).",
+                    },
+                },
+                "required": ["file_path"],
                 "additionalProperties": False,
             },
         },

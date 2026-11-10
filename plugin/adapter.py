@@ -186,6 +186,171 @@ def _resolve_effect_id(raw: Optional[str]) -> Optional[str]:
     return EFFECT_MAP.get(cleaned.lower())
 
 
+CUSTOM_EFFECT_PREFIX = "__bb_custom:"
+
+# Apple iMessage animated text effects (__kIMTextEffectAttributeName = 1..12).
+TEXT_EFFECT_MAP: dict[str, int] = {
+    "ripple": 1,
+    "scale_ripple": 1,
+    "scaleripple": 1,
+    "stretch": 2,
+    "squish": 3,
+    "bounce": 4,
+    "big": 5,
+    "bloom": 6,
+    "somersault": 7,
+    "nod": 8,
+    "shake_vertical": 8,
+    "shakevertical": 8,
+    "shake": 9,
+    "shake_horizontal": 9,
+    "shakehorizontal": 9,
+    "jitter": 10,
+    "small": 11,
+    "explode": 12,
+}
+TEXT_STYLE_ALIASES: dict[str, str] = {
+    "bold": "bold",
+    "italic": "italic",
+    "underline": "underline",
+    "strikethrough": "strikethrough",
+    "strike": "strikethrough",
+}
+
+
+def _resolve_text_effect(raw: Any) -> Optional[str]:
+    """Resolve an animated text effect name or integer code (1..12) to its canonical name."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        for name, code in TEXT_EFFECT_MAP.items():
+            if code == raw and "_" not in name:
+                return name
+        return None
+    if isinstance(raw, str):
+        key = raw.strip().lower()
+        if not key:
+            return None
+        code = TEXT_EFFECT_MAP.get(key)
+        if code is not None:
+            for name, c in TEXT_EFFECT_MAP.items():
+                if c == code and "_" not in name:
+                    return name
+    return None
+
+
+def _normalize_text_styles(raw: Any) -> Optional[list[str]]:
+    """Normalize a list or comma-separated string of inline text styles."""
+    if raw is None:
+        return []
+    items: list[Any]
+    if isinstance(raw, str):
+        items = [part.strip() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        return None
+    normalized: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            return None
+        canon = TEXT_STYLE_ALIASES.get(item.strip().lower())
+        if not canon:
+            return None
+        if canon not in normalized:
+            normalized.append(canon)
+    return normalized
+
+
+def _normalize_text_ranges(raw: Any) -> Optional[list[dict[str, Any]]]:
+    """Validate and normalize range-based formatting specs."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return None
+    normalized: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return None
+        start = entry.get("start")
+        length = entry.get("length")
+        if (
+            not isinstance(start, int)
+            or isinstance(start, bool)
+            or start < 0
+            or not isinstance(length, int)
+            or isinstance(length, bool)
+            or length <= 0
+        ):
+            return None
+        styles = _normalize_text_styles(entry.get("styles"))
+        if styles is None:
+            return None
+        for flag in ("bold", "italic", "underline", "strikethrough", "strike"):
+            if entry.get(flag) is True:
+                canon = TEXT_STYLE_ALIASES[flag]
+                if canon not in styles:
+                    styles.append(canon)
+        raw_te = entry.get("text_effect") if "text_effect" in entry else entry.get("effect")
+        te: Optional[str] = None
+        if raw_te is not None and str(raw_te).strip() != "":
+            te = _resolve_text_effect(raw_te)
+            if not te:
+                return None
+        if not styles and not te:
+            return None
+        spec_item: dict[str, Any] = {"start": start, "length": length}
+        if styles:
+            spec_item["styles"] = styles
+        if te:
+            spec_item["text_effect"] = te
+        normalized.append(spec_item)
+    return normalized
+
+
+def _parse_send_at_timestamp(send_at: Any = None, delay_seconds: Any = None) -> Optional[float]:
+    """Parse ``send_at`` (unix seconds/ms or ISO-8601 string) or ``delay_seconds`` into a future unix timestamp."""
+    now = time.time()
+    if delay_seconds is not None and delay_seconds != "":
+        if isinstance(delay_seconds, bool) or not isinstance(delay_seconds, (int, float)):
+            try:
+                delay_val = float(str(delay_seconds).strip())
+            except ValueError:
+                return None
+        else:
+            delay_val = float(delay_seconds)
+        if delay_val <= 0:
+            return None
+        return now + delay_val
+
+    if send_at is None or isinstance(send_at, bool):
+        return None
+    if isinstance(send_at, (int, float)):
+        ts = float(send_at)
+        if ts > 1e11:
+            ts /= 1000.0
+        return ts if ts > now else None
+    if isinstance(send_at, str):
+        cleaned = send_at.strip()
+        if not cleaned:
+            return None
+        with suppress(ValueError):
+            ts = float(cleaned)
+            if ts > 1e11:
+                ts /= 1000.0
+            return ts if ts > now else None
+        with suppress(ValueError):
+            iso_str = cleaned[:-1] + "+00:00" if cleaned.endswith(("Z", "z")) else cleaned
+            dt = datetime.fromisoformat(iso_str)
+            ts = dt.timestamp()
+            return ts if ts > now else None
+    return None
+
+
+def _encode_custom_effect_spec(spec: dict[str, Any]) -> str:
+    return f"{CUSTOM_EFFECT_PREFIX}{json.dumps(spec, separators=(',', ':'))}"
+
+
 def _redact(text: str) -> str:
     """Redact phone numbers and emails from log output."""
     return _EMAIL_RE.sub("[REDACTED]", _PHONE_RE.sub("[REDACTED]", text))
@@ -862,9 +1027,19 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             self._remember_sent_message(chat_id, guid, last.message_id)
         return last
 
-    async def send_effect(self, chat_id: str, content: str = "", *, effect: Optional[str] = None,
-                          subject: Optional[str] = None, reply_to: Optional[str] = None) -> dict[str, Any]:
-        """Send an iMessage with a bubble/screen effect and/or bold subject line via Private API."""
+    async def send_effect(
+        self,
+        chat_id: str,
+        content: str = "",
+        *,
+        effect: Optional[str] = None,
+        text_effect: Optional[str] = None,
+        styles: Optional[Any] = None,
+        ranges: Optional[Any] = None,
+        subject: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Send an iMessage with bubble/screen effect, inline text formatting, animated text effect, and/or subject."""
         if not self.client or not self._private_api_enabled or not self._helper_connected:
             return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
         effect_id: Optional[str] = None
@@ -872,12 +1047,26 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             effect_id = _resolve_effect_id(str(effect))
             if not effect_id:
                 return {"success": False, "error": f"Unsupported iMessage effect: {effect}"}
+        resolved_text_effect: Optional[str] = None
+        if text_effect is not None and str(text_effect).strip():
+            resolved_text_effect = _resolve_text_effect(text_effect)
+            if not resolved_text_effect:
+                return {"success": False, "error": f"Unsupported iMessage text_effect: {text_effect}"}
+        normalized_styles = _normalize_text_styles(styles)
+        if normalized_styles is None:
+            return {"success": False, "error": "Unsupported text styles; use bold, italic, underline, strikethrough"}
+        normalized_ranges = _normalize_text_ranges(ranges)
+        if normalized_ranges is None:
+            return {"success": False, "error": "Invalid formatting ranges"}
+
         cleaned_subject = (subject or "").strip() or None
-        text = self.format_message(content or "")
+        has_custom_formatting = bool(resolved_text_effect or normalized_styles or normalized_ranges)
+        # Preserve raw content when explicit character-offset ranges are supplied so offsets stay exact.
+        text = (content or "").strip() if normalized_ranges else self.format_message(content or "")
         if not text and not cleaned_subject:
             return {"success": False, "error": "Message text or subject is required"}
-        if not effect_id and not cleaned_subject:
-            return {"success": False, "error": "Specify an effect and/or subject"}
+        if not effect_id and not cleaned_subject and not has_custom_formatting:
+            return {"success": False, "error": "Specify an effect, text_effect, styles, ranges, and/or subject"}
         if not self._is_target_allowed(chat_id):
             return {"success": False, "error": "Chat not allowed for this profile"}
         guid = await self._resolve_chat_guid(chat_id)
@@ -889,7 +1078,18 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             "message": text,
             "method": "private-api",
         }
-        if effect_id:
+        if has_custom_formatting:
+            spec: dict[str, Any] = {"mode": "formatted_text"}
+            if normalized_styles:
+                spec["styles"] = normalized_styles
+            if resolved_text_effect:
+                spec["text_effect"] = resolved_text_effect
+            if normalized_ranges:
+                spec["ranges"] = normalized_ranges
+            if effect_id:
+                spec["bubble_effect"] = effect_id
+            payload["effectId"] = _encode_custom_effect_spec(spec)
+        elif effect_id:
             payload["effectId"] = effect_id
         if cleaned_subject:
             payload["subject"] = cleaned_subject
@@ -900,7 +1100,337 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         if not res.success:
             return {"success": False, "error": res.error}
         self._remember_sent_message(chat_id, guid, res.message_id)
-        return {"success": True, "message_id": res.message_id, "effect_id": effect_id, "subject": cleaned_subject}
+        out: dict[str, Any] = {
+            "success": True,
+            "message_id": res.message_id,
+            "effect_id": effect_id,
+            "subject": cleaned_subject,
+        }
+        if resolved_text_effect:
+            out["text_effect"] = resolved_text_effect
+        if normalized_styles:
+            out["styles"] = normalized_styles
+        if normalized_ranges:
+            out["ranges"] = normalized_ranges
+        return out
+
+    async def send_later(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        send_at: Any = None,
+        delay_seconds: Any = None,
+        subject: Optional[str] = None,
+        effect: Optional[str] = None,
+        text_effect: Optional[str] = None,
+        styles: Optional[Any] = None,
+        ranges: Optional[Any] = None,
+        reply_to: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Schedule a native iMessage ('Send Later') for future delivery via the Private API helper."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        scheduled_ts = _parse_send_at_timestamp(send_at=send_at, delay_seconds=delay_seconds)
+        if scheduled_ts is None:
+            return {"success": False, "error": "Provide a future 'send_at' timestamp/ISO-8601 datetime or positive 'delay_seconds'"}
+        effect_id: Optional[str] = None
+        if effect is not None and str(effect).strip():
+            effect_id = _resolve_effect_id(str(effect))
+            if not effect_id:
+                return {"success": False, "error": f"Unsupported iMessage effect: {effect}"}
+        resolved_text_effect: Optional[str] = None
+        if text_effect is not None and str(text_effect).strip():
+            resolved_text_effect = _resolve_text_effect(text_effect)
+            if not resolved_text_effect:
+                return {"success": False, "error": f"Unsupported iMessage text_effect: {text_effect}"}
+        normalized_styles = _normalize_text_styles(styles)
+        if normalized_styles is None:
+            return {"success": False, "error": "Unsupported text styles"}
+        normalized_ranges = _normalize_text_ranges(ranges)
+        if normalized_ranges is None:
+            return {"success": False, "error": "Invalid formatting ranges"}
+        cleaned_subject = (subject or "").strip() or None
+        text = (content or "").strip() if normalized_ranges else self.format_message(content or "")
+        if not text:
+            return {"success": False, "error": "Scheduled message text cannot be empty"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+
+        spec: dict[str, Any] = {
+            "mode": "send_later",
+            "scheduled_at": round(scheduled_ts, 3),
+        }
+        if normalized_styles:
+            spec["styles"] = normalized_styles
+        if resolved_text_effect:
+            spec["text_effect"] = resolved_text_effect
+        if normalized_ranges:
+            spec["ranges"] = normalized_ranges
+        if effect_id:
+            spec["bubble_effect"] = effect_id
+
+        payload: dict[str, Any] = {
+            "chatGuid": guid,
+            "tempGuid": _temp_guid(),
+            "message": text,
+            "method": "private-api",
+            "effectId": _encode_custom_effect_spec(spec),
+        }
+        if cleaned_subject:
+            payload["subject"] = cleaned_subject
+        if reply_to:
+            payload["selectedMessageGuid"] = reply_to
+            payload["partIndex"] = 0
+        res = await self._post_message("/api/v1/message/text", payload)
+        if not res.success:
+            return {"success": False, "error": res.error}
+        self._remember_sent_message(chat_id, guid, res.message_id)
+        return {
+            "success": True,
+            "message_id": res.message_id,
+            "scheduled_at": round(scheduled_ts, 3),
+        }
+
+    async def send_poll(
+        self,
+        chat_id: str,
+        title: str,
+        options: list[Any],
+        *,
+        reply_to: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create and send a native iMessage Poll in *chat_id*."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        cleaned_title = (title or "").strip()
+        if not isinstance(options, list):
+            return {"success": False, "error": "Poll 'options' must be a list of at least 2 options"}
+        cleaned_options: list[Any] = []
+        for opt in options:
+            if isinstance(opt, str):
+                val = opt.strip()
+                if val:
+                    cleaned_options.append(val)
+            elif isinstance(opt, dict):
+                txt = str(opt.get("text") or "").strip()
+                if txt:
+                    entry: dict[str, Any] = {"text": txt}
+                    if opt.get("id"):
+                        entry["id"] = str(opt["id"]).strip()
+                    if "can_be_edited" in opt:
+                        entry["can_be_edited"] = bool(opt["can_be_edited"])
+                    cleaned_options.append(entry)
+        if len(cleaned_options) < 2 or len(cleaned_options) > 12:
+            return {"success": False, "error": "A poll requires between 2 and 12 non-empty options"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+
+        spec: dict[str, Any] = {
+            "mode": "poll_create",
+            "title": cleaned_title,
+            "options": cleaned_options,
+        }
+        payload: dict[str, Any] = {
+            "chatGuid": guid,
+            "tempGuid": _temp_guid(),
+            "message": cleaned_title or "Poll",
+            "method": "private-api",
+            "effectId": _encode_custom_effect_spec(spec),
+        }
+        if reply_to:
+            payload["selectedMessageGuid"] = reply_to
+            payload["partIndex"] = 0
+        res = await self._post_message("/api/v1/message/text", payload)
+        if not res.success:
+            return {"success": False, "error": res.error}
+        self._remember_sent_message(chat_id, guid, res.message_id)
+        return {
+            "success": True,
+            "message_id": res.message_id,
+            "title": cleaned_title,
+            "options": cleaned_options,
+        }
+
+    async def vote_poll(
+        self,
+        chat_id: str,
+        poll_message_id: str,
+        option: Any,
+    ) -> dict[str, Any]:
+        """Cast a vote on an existing native iMessage Poll by option text, 1-based index, or option UUID."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        target_poll = (poll_message_id or "").strip()
+        if not target_poll:
+            return {"success": False, "error": "A poll message_id is required"}
+        if option is None or option == "" or option == []:
+            return {"success": False, "error": "Specify an option (1-based index, option text, or option UUID)"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+        if target_poll.lower() == "last":
+            target_poll = self._resolve_sent_message_id(chat_id, guid, "last") or ""
+        if not target_poll:
+            return {"success": False, "error": "No poll message GUID available"}
+
+        spec: dict[str, Any] = {
+            "mode": "poll_vote",
+            "poll_guid": target_poll,
+        }
+        if isinstance(option, list):
+            spec["options"] = option
+        else:
+            spec["option"] = option
+        payload: dict[str, Any] = {
+            "chatGuid": guid,
+            "tempGuid": _temp_guid(),
+            "message": "Vote",
+            "method": "private-api",
+            "selectedMessageGuid": target_poll,
+            "partIndex": 0,
+            "effectId": _encode_custom_effect_spec(spec),
+        }
+        res = await self._post_message("/api/v1/message/text", payload)
+        if not res.success:
+            return {"success": False, "error": res.error}
+        return {"success": True, "message_id": res.message_id, "poll_message_id": target_poll}
+
+    async def add_poll_option(
+        self,
+        chat_id: str,
+        poll_message_id: str,
+        option_text: str,
+    ) -> dict[str, Any]:
+        """Add a new choice to an existing native iMessage Poll."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        target_poll = (poll_message_id or "").strip()
+        cleaned_opt = (option_text or "").strip()
+        if not target_poll:
+            return {"success": False, "error": "A poll message_id is required"}
+        if not cleaned_opt:
+            return {"success": False, "error": "A non-empty option_text is required"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+        if target_poll.lower() == "last":
+            target_poll = self._resolve_sent_message_id(chat_id, guid, "last") or ""
+        if not target_poll:
+            return {"success": False, "error": "No poll message GUID available"}
+
+        spec: dict[str, Any] = {
+            "mode": "poll_add_option",
+            "poll_guid": target_poll,
+            "option_text": cleaned_opt,
+        }
+        payload: dict[str, Any] = {
+            "chatGuid": guid,
+            "tempGuid": _temp_guid(),
+            "message": cleaned_opt,
+            "method": "private-api",
+            "selectedMessageGuid": target_poll,
+            "partIndex": 0,
+            "effectId": _encode_custom_effect_spec(spec),
+        }
+        res = await self._post_message("/api/v1/message/text", payload)
+        if not res.success:
+            return {"success": False, "error": res.error}
+        return {
+            "success": True,
+            "message_id": res.message_id,
+            "poll_message_id": target_poll,
+            "option_text": cleaned_opt,
+        }
+
+    async def send_sticker(
+        self,
+        chat_id: str,
+        file_path: str,
+        *,
+        reply_to: Optional[str] = None,
+        tapback: bool = False,
+        remove: bool = False,
+        x_scalar: float = 0.0,
+        y_scalar: float = 0.0,
+        scale: float = 1.0,
+        rotation: float = 0.0,
+        layout_intent: int = 0,
+        part_index: int = 0,
+    ) -> dict[str, Any]:
+        """Send an image as a sticker tapback (2007/3007), freeform message overlay (1000), or standalone sticker."""
+        if not self.client or not self._private_api_enabled or not self._helper_connected:
+            return {"success": False, "error": "BlueBubbles Private API helper is unavailable"}
+        if not self._is_target_allowed(chat_id):
+            return {"success": False, "error": "Chat not allowed for this profile"}
+        if not file_path or not await asyncio.to_thread(os.path.isfile, file_path):
+            return {"success": False, "error": f"File not found: {file_path}"}
+        if (tapback or remove) and not reply_to:
+            return {"success": False, "error": "Sticker tapback requires a target message_id"}
+        guid = await self._resolve_chat_guid(chat_id)
+        if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
+            return {"success": False, "error": "Chat not found"}
+
+        target_msg = (reply_to or "").strip() or None
+        if target_msg and target_msg.lower() == "last":
+            target_msg = self._resolve_sent_message_id(chat_id, guid, "last")
+            if not target_msg:
+                return {"success": False, "error": "No sent message GUID available in this chat"}
+
+        spec: dict[str, Any] = {
+            "mode": "sticker_tapback" if (tapback or remove) else "sticker",
+            "is_tapback": bool(tapback or remove),
+            "remove": bool(remove),
+            "x_scalar": float(x_scalar),
+            "y_scalar": float(y_scalar),
+            "scale": float(scale),
+            "rotation": float(rotation),
+            "layout_intent": int(layout_intent),
+        }
+        fname = os.path.basename(file_path)
+        try:
+            file_bytes = await asyncio.to_thread(Path(file_path).read_bytes)
+            form_data: dict[str, str] = {
+                "chatGuid": guid,
+                "name": fname,
+                "tempGuid": uuid.uuid4().hex,
+                "method": "private-api",
+                "effectId": _encode_custom_effect_spec(spec),
+            }
+            if target_msg:
+                form_data["selectedMessageGuid"] = target_msg
+                form_data["partIndex"] = str(max(0, int(part_index)))
+            res = await self.client.post(
+                self._api_url("/api/v1/message/attachment"),
+                data=form_data,
+                timeout=120,
+                files={"attachment": (fname, file_bytes, "application/octet-stream")},
+            )
+            res.raise_for_status()
+            result = res.json()
+            if result.get("status") == 200:
+                rdata = result.get("data") or {}
+                msg_id = rdata.get("guid") if isinstance(rdata, dict) else None
+                self._remember_sent_message(chat_id, guid, msg_id)
+                return {
+                    "success": True,
+                    "message_id": msg_id or "ok",
+                    "mode": spec["mode"],
+                    "target_message_id": target_msg,
+                }
+            return {"success": False, "error": str(result.get("message") or "Sticker send failed")}
+        except Exception as exc:
+            return {"success": False, "error": str(exc) or type(exc).__name__}
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *,
                            finalize: bool = False, part_index: int = 0) -> SendResult:

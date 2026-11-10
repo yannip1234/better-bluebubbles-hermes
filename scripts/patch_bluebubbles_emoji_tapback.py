@@ -16,6 +16,8 @@ What this script patches:
      re-exports `BlueBubblesHelperOrig.dylib` and swizzles:
        * +[BlueBubblesHelper parseReactionType:]
        * +[BlueBubblesHelper reactionToVerb:]
+       * -[BlueBubblesHelper handleMessage:message:] (inline text formatting & animated text effects,
+         native Send Later scheduled messages, native iMessage Polls, and sticker tapbacks/overlays)
        * -[IMMessage initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:associatedMessageGUID:associatedMessageType:associatedMessageRange:messageSummaryInfo:]
 """
 

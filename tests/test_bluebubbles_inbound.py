@@ -1034,3 +1034,84 @@ class TestBlueBubblesProfileRouting:
         assert handled[0].media_urls == []
         assert handled[0].media_types == []
         assert handled[0].text == "https://docs.google.com/document/d/1iS_4rjdT_slSxqpOJZKDUh-n5Aynf-xJ9sl9wjFch8s/"
+
+    @pytest.mark.asyncio
+    async def test_inbound_poll_creation_and_vote_decoded_from_payload_data(self, monkeypatch):
+        import plistlib
+
+        adapter, handled = self._capture(monkeypatch)
+        dm = {"guid": "iMessage;-;+15551234567", "chatIdentifier": "+15551234567", "style": 45}
+        poll_balloon_id = "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.messages.Polls"
+
+        poll_def_json = json.dumps(
+            {
+                "value": {
+                    "orderedPollOptions": [
+                        {"text": "Tacos", "attributedText": "Tacos", "identifier": "OPT-1", "creatorHandle": ""},
+                        {"text": "Sushi", "attributedText": "Sushi", "identifier": "OPT-2", "creatorHandle": ""},
+                    ],
+                    "version": 1,
+                },
+                "version": 1,
+            }
+        ).encode("utf-8")
+        poll_bplist = plistlib.dumps({"$objects": ["$null", poll_def_json]}, fmt=plistlib.FMT_BINARY)
+
+        resp1 = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                self._payload(
+                    "new-message",
+                    guid="poll-msg-1",
+                    chat=dm,
+                    text="\ufffc",
+                    balloonBundleId=poll_balloon_id,
+                    payloadData=poll_bplist.hex(),
+                )
+            )
+        )
+        assert resp1.status == 200
+        assert len(handled) == 1
+        assert "[Poll (poll_message_guid=poll-msg-1)]" in handled[0].text
+        assert "1. Tacos (option_id=OPT-1)" in handled[0].text
+        assert "2. Sushi (option_id=OPT-2)" in handled[0].text
+
+        vote_json = json.dumps(
+            {
+                "value": {
+                    "votes": [
+                        {
+                            "voteItemIdentifier": "VOTE-1",
+                            "participantHandle": "+15551234567",
+                            "selectedOptionIdentifier": "OPT-2",
+                        }
+                    ],
+                    "version": 1,
+                },
+                "version": 1,
+            }
+        ).encode("utf-8")
+        vote_bplist = plistlib.dumps({"$objects": ["$null", vote_json]}, fmt=plistlib.FMT_BINARY)
+
+        resp2 = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                self._payload(
+                    "new-message",
+                    guid="poll-vote-1",
+                    chat=dm,
+                    text="",
+                    balloonBundleId=poll_balloon_id,
+                    associatedMessageGuid="p:0/poll-msg-1",
+                    payloadData=vote_bplist.hex(),
+                )
+            )
+        )
+        assert resp2.status == 200
+        assert len(handled) == 2
+        assert "[Poll vote on poll_message_guid=poll-msg-1]" in handled[1].text
+        assert "option_id=OPT-2" in handled[1].text
+
+    def test_sticker_tapback_recognized_as_tapback_code(self):
+        from plugin.inbound import _tapback_Action
+
+        assert _tapback_Action({"associatedMessageGuid": "p:0/msg-1", "associatedMessageType": 2007}) == ("add", "sticker")
+        assert _tapback_Action({"associatedMessageGuid": "p:0/msg-1", "associatedMessageType": 3007}) == ("remove", "sticker")
