@@ -376,6 +376,257 @@ def _encode_custom_effect_spec(spec: dict[str, Any]) -> str:
     return f"{CUSTOM_EFFECT_PREFIX}{json.dumps(spec, separators=(',', ':'))}"
 
 
+_FENCED_CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+-]*[ \t]*\n?(.*?)```", re.DOTALL)
+_STRAY_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n?")
+_INLINE_CODE_RE = re.compile(r"(`+)([^\n`]+?)\1")
+_CODE_TOKEN_RE = re.compile(r"\x00CODE(\d+)\x00")
+_ATX_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.+?)(?:\s+#+)?\s*$")
+_HTTP_LINK_TARGET_RE = re.compile(r"^https?://", re.IGNORECASE)
+_DUNDER_KEYWORDS = frozenset({
+    "init", "main", "name", "file", "doc", "dict", "class", "str", "repr", "all",
+    "version", "future", "new", "call", "len", "getitem", "setitem", "enter", "exit",
+    "aiter", "anext", "post_init", "slots", "path", "package", "spec", "loader",
+})
+_INLINE_MD_PATTERNS: tuple[tuple[str, re.Pattern[str], tuple[str, ...]], ...] = (
+    ("link", re.compile(r"\[([^\n\]]+)\]\(([^\n\)]+)\)"), ()),
+    ("bold_italic", re.compile(r"\*\*\*(?![\s*])(.+?)(?<![\s*])\*\*\*(?!\*)"), ("bold", "italic")),
+    ("bold", re.compile(r"\*\*(?![\s*])(.+?)(?<!\s)\*\*(?!\*)"), ("bold",)),
+    ("underline", re.compile(r"(?<![\w_])__(?![\s_])(.+?)(?<![\s_])__(?![\w_(])"), ("underline",)),
+    ("strikethrough", re.compile(r"~~(?!\s)(.+?)(?<!\s)~~"), ("strikethrough",)),
+    ("italic_star", re.compile(r"(?<!\*)\*(?![\s*])([^\n*]+?)(?<![\s*])\*(?!\*)"), ("italic",)),
+    ("italic_under", re.compile(r"(?<![\w_])_(?![\s_])([^\n_]+?)(?<![\s_])_(?![\w_])"), ("italic",)),
+)
+
+
+def _merge_style_tuples(base: tuple[str, ...], added: tuple[str, ...]) -> tuple[str, ...]:
+    if not added:
+        return base
+    out = list(base)
+    for st in added:
+        if st not in out:
+            out.append(st)
+    return tuple(out)
+
+
+def _restore_code_tokens(text: str, code_store: list[str]) -> str:
+    if "\x00CODE" not in text:
+        return text
+    return _CODE_TOKEN_RE.sub(lambda m: code_store[int(m.group(1))], text)
+
+
+def _parse_inline_md_segments(
+    text: str,
+    active_styles: tuple[str, ...],
+    code_store: list[str],
+) -> list[tuple[str, tuple[str, ...]]]:
+    segments: list[tuple[str, tuple[str, ...]]] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        best_match: Optional[re.Match[str]] = None
+        best_kind = ""
+        best_styles: tuple[str, ...] = ()
+        best_priority = 999
+        for priority, (kind, pat, styles) in enumerate(_INLINE_MD_PATTERNS):
+            m = pat.search(text, pos)
+            if m is None:
+                continue
+            if kind == "underline" and m.group(1).strip().lower() in _DUNDER_KEYWORDS:
+                continue
+            if best_match is None or (m.start(), priority) < (best_match.start(), best_priority):
+                best_match = m
+                best_kind = kind
+                best_styles = styles
+                best_priority = priority
+        if best_match is None:
+            tail = _restore_code_tokens(text[pos:], code_store)
+            if tail:
+                segments.append((tail, active_styles))
+            break
+        if best_match.start() > pos:
+            prefix = _restore_code_tokens(text[pos:best_match.start()], code_store)
+            if prefix:
+                segments.append((prefix, active_styles))
+        if best_kind == "link":
+            raw_label, raw_target = best_match.group(1), best_match.group(2)
+            target = _restore_code_tokens(raw_target, code_store).strip()
+            label_segs = _parse_inline_md_segments(raw_label, active_styles, code_store)
+            plain_label = "".join(seg_text for seg_text, _ in label_segs).strip()
+            if _HTTP_LINK_TARGET_RE.match(target):
+                if plain_label == target:
+                    segments.append((target, active_styles))
+                else:
+                    segments.extend(label_segs)
+                    segments.append((f"\n{target}", ()))
+            else:
+                segments.extend(label_segs)
+        else:
+            combined = _merge_style_tuples(active_styles, best_styles)
+            segments.extend(_parse_inline_md_segments(best_match.group(1), combined, code_store))
+        pos = best_match.end()
+    return segments
+
+
+def _parse_markdown_to_styled_chars(content: str) -> tuple[str, list[tuple[str, ...]]]:
+    """Parse Markdown into ``(plain_text, per_char_styles)`` aligned by character index."""
+    raw = content or ""
+    if not raw:
+        return "", []
+    code_store: list[str] = []
+
+    def _stash_fenced(m: re.Match[str]) -> str:
+        idx = len(code_store)
+        code_store.append(m.group(1).strip("\n"))
+        return f"\x00CODE{idx}\x00"
+
+    def _stash_inline(m: re.Match[str]) -> str:
+        idx = len(code_store)
+        code_store.append(m.group(2))
+        return f"\x00CODE{idx}\x00"
+
+    protected = _FENCED_CODE_BLOCK_RE.sub(_stash_fenced, raw)
+    protected = _STRAY_FENCE_RE.sub("", protected)
+    protected = _INLINE_CODE_RE.sub(_stash_inline, protected)
+
+    lines = protected.split("\n")
+    all_segments: list[tuple[str, tuple[str, ...]]] = []
+    for line_idx, line in enumerate(lines):
+        if line_idx > 0:
+            all_segments.append(("\n", ()))
+        heading_match = _ATX_HEADING_RE.match(line)
+        if heading_match:
+            all_segments.extend(_parse_inline_md_segments(heading_match.group(1), ("bold",), code_store))
+        else:
+            all_segments.extend(_parse_inline_md_segments(line, (), code_store))
+
+    chars: list[str] = []
+    styles: list[tuple[str, ...]] = []
+    newline_run = 0
+    for seg_text, seg_styles in all_segments:
+        for ch in seg_text:
+            if ch == "\n":
+                newline_run += 1
+                if newline_run > 2:
+                    continue
+                chars.append(ch)
+                styles.append(())
+            else:
+                newline_run = 0
+                chars.append(ch)
+                styles.append(seg_styles)
+
+    start = 0
+    end = len(chars)
+    while start < end and chars[start].isspace():
+        start += 1
+    while end > start and chars[end - 1].isspace():
+        end -= 1
+    return "".join(chars[start:end]), styles[start:end]
+
+
+def _styled_chars_to_ranges(plain_text: str, char_styles: list[tuple[str, ...]]) -> list[dict[str, Any]]:
+    """Convert aligned ``(plain_text, char_styles)`` into UTF-16 ``ranges`` specs for IMFoundation."""
+    if not plain_text or not char_styles:
+        return []
+    ranges: list[dict[str, Any]] = []
+    u16_pos = 0
+    cur_styles: tuple[str, ...] = ()
+    cur_start = 0
+    cur_len = 0
+    for ch, st in zip(plain_text, char_styles):
+        ch_u16 = 2 if ord(ch) > 0xFFFF else 1
+        if st == cur_styles:
+            cur_len += ch_u16
+        else:
+            if cur_styles and cur_len > 0:
+                ranges.append({"start": cur_start, "length": cur_len, "styles": list(cur_styles)})
+            cur_styles = st
+            cur_start = u16_pos
+            cur_len = ch_u16
+        u16_pos += ch_u16
+    if cur_styles and cur_len > 0:
+        ranges.append({"start": cur_start, "length": cur_len, "styles": list(cur_styles)})
+    return ranges
+
+
+def _parse_markdown_rich_text(content: str) -> tuple[str, list[dict[str, Any]]]:
+    """Parse a Markdown string into ``(plain_text, utf16_ranges)``."""
+    plain_text, char_styles = _parse_markdown_to_styled_chars(content)
+    return plain_text, _styled_chars_to_ranges(plain_text, char_styles)
+
+
+def _slice_styled_segment(
+    plain_text: str,
+    char_styles: list[tuple[str, ...]],
+    start: int,
+    end: int,
+) -> tuple[str, list[tuple[str, ...]]]:
+    while start < end and plain_text[start].isspace():
+        start += 1
+    while end > start and plain_text[end - 1].isspace():
+        end -= 1
+    return plain_text[start:end], char_styles[start:end]
+
+
+def _truncate_styled_segment(
+    plain_text: str,
+    char_styles: list[tuple[str, ...]],
+    max_length: int = MAX_TEXT_LENGTH,
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    if len(plain_text) <= max_length:
+        return [(plain_text, _styled_chars_to_ranges(plain_text, char_styles))]
+    out: list[tuple[str, list[dict[str, Any]]]] = []
+    pos = 0
+    n = len(plain_text)
+    headroom = max(1, max_length - 10)
+    while pos < n:
+        while pos < n and plain_text[pos].isspace():
+            pos += 1
+        if n - pos <= max_length:
+            sub_t, sub_s = _slice_styled_segment(plain_text, char_styles, pos, n)
+            if sub_t:
+                out.append((sub_t, _styled_chars_to_ranges(sub_t, sub_s)))
+            break
+        limit = min(n, pos + headroom)
+        region = plain_text[pos:limit]
+        rel_split = region.rfind("\n")
+        if rel_split < headroom // 2:
+            rel_split = region.rfind(" ")
+        if rel_split < 1:
+            rel_split = limit - pos
+        split_at = pos + rel_split
+        sub_t, sub_s = _slice_styled_segment(plain_text, char_styles, pos, split_at)
+        if sub_t:
+            out.append((sub_t, _styled_chars_to_ranges(sub_t, sub_s)))
+        pos = split_at
+    return out or [(plain_text[:max_length], _styled_chars_to_ranges(plain_text[:max_length], char_styles[:max_length]))]
+
+
+def _split_markdown_chunks(
+    content: str,
+    max_length: int = MAX_TEXT_LENGTH,
+    *,
+    split_paragraphs: bool = True,
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Parse Markdown *content* and split into ``(plain_chunk, utf16_ranges)`` tuples."""
+    plain_text, char_styles = _parse_markdown_to_styled_chars(content)
+    if not plain_text:
+        return []
+    if not split_paragraphs:
+        return _truncate_styled_segment(plain_text, char_styles, max_length)
+    chunks: list[tuple[str, list[dict[str, Any]]]] = []
+    prev_end = 0
+    for m in re.finditer(r"\n\s*\n", plain_text):
+        sub_t, sub_s = _slice_styled_segment(plain_text, char_styles, prev_end, m.start())
+        if sub_t:
+            chunks.extend(_truncate_styled_segment(sub_t, sub_s, max_length))
+        prev_end = m.end()
+    sub_t, sub_s = _slice_styled_segment(plain_text, char_styles, prev_end, len(plain_text))
+    if sub_t:
+        chunks.extend(_truncate_styled_segment(sub_t, sub_s, max_length))
+    return chunks or _truncate_styled_segment(plain_text, char_styles, max_length)
+
+
 def _redact(text: str) -> str:
     """Redact phone numbers and emails from log output."""
     return _EMAIL_RE.sub("[REDACTED]", _PHONE_RE.sub("[REDACTED]", text))
@@ -1254,7 +1505,8 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
-        text = self.format_message(content)
+        raw_content = content or ""
+        text = self.format_message(raw_content)
         meta = metadata if isinstance(metadata, dict) else {}
         subject = str(meta.get("subject") or "").strip() or None
         raw_effect = meta.get("effect") or meta.get("effect_id") or meta.get("effectId")
@@ -1276,13 +1528,15 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             self._cancel_turn_placeholder_task(turn_key)
 
         if in_active_turn and not is_final_send:
-            cleaned_text = _strip_tapback_progress_lines(text)
-            if not cleaned_text:
+            cleaned_raw = _strip_tapback_progress_lines(raw_content)
+            prog_chunks = _split_markdown_chunks(
+                cleaned_raw, self.MAX_MESSAGE_LENGTH, split_paragraphs=False
+            )
+            if not prog_chunks:
                 return SendResult(
                     success=True,
                     message_id=self._turn_progress_bubbles.get(turn_key) or "ok",
                 )
-            text = cleaned_text
             if (
                 self.status_tapbacks_enabled
                 and turn_key not in self._turn_agent_tapback_override
@@ -1296,15 +1550,15 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                 await self._set_turn_status_tapback(
                     turn_key, chat_id, self._turn_reply_to.get(turn_key), "🧠"
                 )
-            single_chunk = (
-                text
-                if len(text) <= self.MAX_MESSAGE_LENGTH
-                else self.truncate_message(text, self.MAX_MESSAGE_LENGTH)[-1]
-            )
+            single_chunk, single_ranges = prog_chunks[-1]
             existing_prog_id = self._turn_progress_bubbles.get(turn_key)
             if existing_prog_id:
                 return await self.edit_message(
-                    chat_id, existing_prog_id, single_chunk, finalize=False, metadata=meta
+                    chat_id,
+                    existing_prog_id,
+                    single_chunk,
+                    finalize=False,
+                    metadata={**meta, "_rich_ranges": single_ranges},
                 )
             reply_anchor = reply_to or self._turn_reply_to.get(turn_key)
             guid = await self._resolve_chat_guid(chat_id)
@@ -1315,6 +1569,11 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             payload: dict[str, Any] = {"chatGuid": guid, "tempGuid": _temp_guid(), "message": single_chunk}
             if reply_anchor:
                 payload.update(method="private-api", selectedMessageGuid=reply_anchor, partIndex=0)
+            if single_ranges:
+                payload.update(
+                    method="private-api",
+                    effectId=_encode_custom_effect_spec({"mode": "formatted_text", "ranges": single_ranges}),
+                )
             res = await self._post_message("/api/v1/message/text", payload)
             if res.success and res.message_id and res.message_id != "ok":
                 self._remember_sent_message(chat_id, guid, res.message_id)
@@ -1326,22 +1585,26 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
 
         morphed_first_chunk = False
         used_single_bubble_chunks = False
+        styled_chunks: list[tuple[str, list[dict[str, Any]]]] = []
         last = SendResult(success=True)
         prog_id = self._turn_progress_bubbles.pop(turn_key, None) if (in_active_turn and is_final_send) else None
         if prog_id:
             if not subject and not effect_id:
-                chunks = (
-                    [text]
-                    if len(text) <= self.MAX_MESSAGE_LENGTH
-                    else self.truncate_message(text, self.MAX_MESSAGE_LENGTH)
-                )
+                styled_chunks = _split_markdown_chunks(
+                    raw_content, self.MAX_MESSAGE_LENGTH, split_paragraphs=False
+                ) or [(text, [])]
                 used_single_bubble_chunks = True
+                first_chunk_text, first_chunk_ranges = styled_chunks[0]
                 first_res = await self.edit_message(
-                    chat_id, prog_id, chunks[0], finalize=True, metadata=meta
+                    chat_id,
+                    prog_id,
+                    first_chunk_text,
+                    finalize=True,
+                    metadata={**meta, "_rich_ranges": first_chunk_ranges},
                 )
                 if first_res.success:
                     self._mark_finalized_progress_id(prog_id)
-                    if len(chunks) == 1:
+                    if len(styled_chunks) == 1:
                         return first_res
                     morphed_first_chunk = True
                     last = first_res
@@ -1354,11 +1617,11 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
 
         if not morphed_first_chunk and not used_single_bubble_chunks:
             # Each paragraph becomes its own iMessage bubble; truncate any still too long.
-            paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()] or [text]
-            chunks = [c for para in paragraphs for c in (
-                [para] if len(para) <= self.MAX_MESSAGE_LENGTH else self.truncate_message(para, self.MAX_MESSAGE_LENGTH))]
+            styled_chunks = _split_markdown_chunks(
+                raw_content, self.MAX_MESSAGE_LENGTH, split_paragraphs=True
+            ) or [(text, [])]
 
-        for idx, chunk in enumerate(chunks):
+        for idx, (chunk, chunk_ranges) in enumerate(styled_chunks):
             if morphed_first_chunk and idx == 0:
                 continue
             guid = await self._resolve_chat_guid(chat_id)
@@ -1379,7 +1642,13 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                     payload.update(method="private-api", selectedMessageGuid=reply_to, partIndex=0)
                 if subject and idx == 0:
                     payload.update(method="private-api", subject=subject)
-                if effect_id and idx == len(chunks) - 1:
+                is_last_chunk = idx == len(styled_chunks) - 1
+                if chunk_ranges:
+                    spec: dict[str, Any] = {"mode": "formatted_text", "ranges": chunk_ranges}
+                    if effect_id and is_last_chunk:
+                        spec["bubble_effect"] = effect_id
+                    payload.update(method="private-api", effectId=_encode_custom_effect_spec(spec))
+                elif effect_id and is_last_chunk:
                     payload.update(method="private-api", effectId=effect_id)
             if not (last := await self._post_message("/api/v1/message/text", payload)).success:
                 return last
@@ -1419,9 +1688,14 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             return {"success": False, "error": "Invalid formatting ranges"}
 
         cleaned_subject = (subject or "").strip() or None
-        has_custom_formatting = bool(resolved_text_effect or normalized_styles or normalized_ranges)
         # Preserve raw content when explicit character-offset ranges are supplied so offsets stay exact.
-        text = (content or "").strip() if normalized_ranges else self.format_message(content or "")
+        if normalized_ranges:
+            text = (content or "").strip()
+        else:
+            text, auto_ranges = _parse_markdown_rich_text(content or "")
+            if auto_ranges:
+                normalized_ranges = auto_ranges
+        has_custom_formatting = bool(resolved_text_effect or normalized_styles or normalized_ranges)
         if not text and not cleaned_subject:
             return {"success": False, "error": "Message text or subject is required"}
         if not effect_id and not cleaned_subject and not has_custom_formatting:
@@ -1510,7 +1784,12 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         if normalized_ranges is None:
             return {"success": False, "error": "Invalid formatting ranges"}
         cleaned_subject = (subject or "").strip() or None
-        text = (content or "").strip() if normalized_ranges else self.format_message(content or "")
+        if normalized_ranges:
+            text = (content or "").strip()
+        else:
+            text, auto_ranges = _parse_markdown_rich_text(content or "")
+            if auto_ranges:
+                normalized_ranges = auto_ranges
         if not text:
             return {"success": False, "error": "Scheduled message text cannot be empty"}
         if not self._is_target_allowed(chat_id):
@@ -1795,11 +2074,26 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                            finalize: bool = False, part_index: int = 0,
                            metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Edit a previously sent iMessage via the BlueBubbles Private API, rolling over on Apple's 5-edit cap."""
-        text = self.format_message(content)
+        meta = metadata if isinstance(metadata, dict) else {}
+        raw_content = content or ""
+        preset_ranges = meta.get("_rich_ranges") if "_rich_ranges" in meta else None
+        if isinstance(preset_ranges, list):
+            text = (raw_content).strip()
+            rich_ranges = _normalize_text_ranges(preset_ranges) or []
+        else:
+            parsed_chunks = _split_markdown_chunks(
+                raw_content, self.MAX_MESSAGE_LENGTH, split_paragraphs=False
+            )
+            if parsed_chunks:
+                text, rich_ranges = parsed_chunks[-1]
+            else:
+                text, rich_ranges = "", []
         if not text:
             return SendResult(success=False, error="Edited message text cannot be empty")
         if len(text) > self.MAX_MESSAGE_LENGTH:
-            text = self.truncate_message(text, self.MAX_MESSAGE_LENGTH)[-1]
+            text, rich_ranges = _split_markdown_chunks(
+                text, self.MAX_MESSAGE_LENGTH, split_paragraphs=False
+            )[-1]
         if not self.client or not self._private_api_enabled or not self._helper_connected:
             return SendResult(success=False, error="BlueBubbles Private API helper is unavailable")
         if not self._is_target_allowed(chat_id):
@@ -1822,10 +2116,21 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             active_prog_id and (active_prog_id == target_id or self._follow_replaced_message_id(active_prog_id) == live_id)
         )
         if is_progress_bubble and not finalize:
-            cleaned_text = _strip_tapback_progress_lines(text)
-            if not cleaned_text:
+            cleaned_raw = _strip_tapback_progress_lines(raw_content)
+            if not cleaned_raw:
                 return SendResult(success=True, message_id=target_id)
-            text = cleaned_text
+            if not isinstance(preset_ranges, list):
+                cleaned_chunks = _split_markdown_chunks(
+                    cleaned_raw, self.MAX_MESSAGE_LENGTH, split_paragraphs=False
+                )
+                if not cleaned_chunks:
+                    return SendResult(success=True, message_id=target_id)
+                text, rich_ranges = cleaned_chunks[-1]
+            else:
+                cleaned_text = _strip_tapback_progress_lines(text)
+                if not cleaned_text:
+                    return SendResult(success=True, message_id=target_id)
+                text = cleaned_text
         # Reserve the 5th edit for finalize=True on active turn progress bubbles so the final answer can edit in place.
         max_edits = _IMESSAGE_MAX_EDITS if (finalize or not is_progress_bubble) else (_IMESSAGE_MAX_EDITS - 1)
         edits = self._message_edit_counts.get(live_id, 0)
@@ -1833,11 +2138,22 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         expired = sent_at is not None and (time.monotonic() - sent_at) >= _IMESSAGE_EDIT_WINDOW_SECONDS
 
         if edits < max_edits and not expired:
+            bc_msg = (
+                _encode_custom_effect_spec(
+                    {
+                        "mode": "formatted_text",
+                        "ranges": rich_ranges,
+                        "backward_compat": f'Edited to "{text}"',
+                    }
+                )
+                if rich_ranges
+                else f'Edited to "{text}"'
+            )
             res = await self._post_message(
                 f"/api/v1/message/{quote(live_id, safe='')}/edit",
                 {
                     "editedMessage": text,
-                    "backwardsCompatibilityMessage": f'Edited to "{text}"',
+                    "backwardsCompatibilityMessage": bc_msg,
                     "partIndex": max(0, int(part_index)),
                 },
             )
@@ -1858,6 +2174,11 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         reply_anchor = self._turn_reply_to.get(turn_key) if (turn_key and is_progress_bubble) else None
         if reply_anchor:
             payload.update(method="private-api", selectedMessageGuid=reply_anchor, partIndex=0)
+        if rich_ranges:
+            payload.update(
+                method="private-api",
+                effectId=_encode_custom_effect_spec({"mode": "formatted_text", "ranges": rich_ranges}),
+            )
         new_res = await self._post_message("/api/v1/message/text", payload)
         if new_res.success and new_res.message_id and new_res.message_id != "ok":
             new_id = new_res.message_id
@@ -2339,7 +2660,8 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         return info
 
     def format_message(self, content: str) -> str:
-        return strip_markdown(content, keep_link_targets=True)  # iMessage auto-links bare URLs only
+        plain_text, _ = _parse_markdown_to_styled_chars(content)
+        return plain_text
 
     # --- Inbound attachment downloading ---
 
@@ -2461,12 +2783,12 @@ def interactive_setup() -> None:
 
 # System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable.
 _PLATFORM_HINT = (
-    # The adapter runs strip_markdown(keep_link_targets=True): markers vanish, the layout stays.
-    "You are texting via iMessage (BlueBubbles). Replies arrive as plain text bubbles, so write like a person "
-    "texting: short and conversational, answer first, no preamble or recap. Markdown does not render and is "
-    "stripped, so skip headers, tables, code fences and backticks; for a few items use short lines or a "
-    "sentence rather than nested bullets. Put a command or code snippet on its own line as plain text so it "
-    "can be copied. Write links as bare URLs (iMessage auto-links them). "
+    # The adapter converts inline Markdown (**bold**, *italic*, __underline__, ~~strikethrough~~) to native iMessage rich text.
+    "You are texting via iMessage (BlueBubbles). Write like a person texting: short and conversational, "
+    "answer first, no preamble or recap. Inline rich-text formatting renders natively in iMessage: you can use "
+    "**bold**, *italic*, __underline__, and ~~strikethrough~~. Avoid Markdown tables and code fences; for a few "
+    "items use short lines or bullets (•) rather than deeply nested lists. Put a command or code snippet on its "
+    "own line as plain text so it can be copied. Write links as bare URLs (iMessage auto-links them). "
     "You can send files natively: write MEDIA:/absolute/path/to/file in your response. "
     "Images (.jpg, .png, .heic) appear as photos and other files arrive as attachments. "
     "You can react to messages with bluebubbles_tapback using ANY single emoji (not just the classic 6)—be "

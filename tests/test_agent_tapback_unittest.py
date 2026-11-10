@@ -732,5 +732,107 @@ class ToolRuntimeTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_markdown_rich_text_parsing_send_and_edit(self):
+        from plugin.adapter import _parse_markdown_rich_text
+
+        # 1. Verify bold, italic, underline, strikethrough, bold+italic, code protection, and UTF-16 emoji offsets
+        plain, ranges = _parse_markdown_rich_text(
+            "🔥 **Bold** and *italic* and _also italic_ and __underlined__ and ~~struck~~ and ***both*** with `snake_case *raw*`!"
+        )
+        self.assertEqual(
+            plain,
+            "🔥 Bold and italic and also italic and underlined and struck and both with snake_case *raw*!",
+        )
+        # Note: "🔥 " is 3 UTF-16 code units (2 for surrogate pair 🔥 + 1 for space)
+        self.assertEqual(
+            ranges,
+            [
+                {"start": 3, "length": 4, "styles": ["bold"]},
+                {"start": 12, "length": 6, "styles": ["italic"]},
+                {"start": 23, "length": 11, "styles": ["italic"]},
+                {"start": 39, "length": 10, "styles": ["underline"]},
+                {"start": 54, "length": 6, "styles": ["strikethrough"]},
+                {"start": 65, "length": 4, "styles": ["bold", "italic"]},
+            ],
+        )
+
+        # 2. Verify ATX heading + nested inline formatting + links
+        plain_h, ranges_h = _parse_markdown_rich_text(
+            "## Office Hours (*Spring*)\nVisit [**Course Page**](https://example.com/course)"
+        )
+        self.assertEqual(plain_h, "Office Hours (Spring)\nVisit Course Page\nhttps://example.com/course")
+        self.assertEqual(
+            ranges_h,
+            [
+                {"start": 0, "length": 14, "styles": ["bold"]},
+                {"start": 14, "length": 6, "styles": ["bold", "italic"]},
+                {"start": 20, "length": 1, "styles": ["bold"]},
+                {"start": 28, "length": 11, "styles": ["bold"]},
+            ],
+        )
+
+        # 3. Verify send() and edit_message() emit __bb_custom formatted_text specs
+        adapter = BlueBubblesAdapter(
+            PlatformConfig(extra={"server_url": "http://localhost:1234", "password": "fake"})
+        )
+        adapter.client = AsyncMock()
+        adapter._private_api_enabled = True
+        adapter._helper_connected = True
+        adapter._guid_cache["+15551234567"] = "iMessage;-;+15551234567"
+        adapter._guid_cache["iMessage;-;+15551234567"] = "iMessage;-;+15551234567"
+
+        api_calls: list[tuple[str, dict]] = []
+
+        async def fake_post_message(path: str, payload: dict):
+            api_calls.append((path, dict(payload)))
+            if path == "/api/v1/message/text":
+                return SendResult(success=True, message_id="msg-rich-1")
+            return SendResult(success=True, message_id="ok")
+
+        adapter._post_message = AsyncMock(side_effect=fake_post_message)
+
+        async def run_send_and_edit():
+            res = await adapter.send("+15551234567", "• **Tuesdays**, __1:45–3:45 p.m.__ — *Room 301D*")
+            self.assertTrue(res.success)
+            self.assertEqual(api_calls[-1][0], "/api/v1/message/text")
+            sent_payload = api_calls[-1][1]
+            self.assertEqual(sent_payload["message"], "• Tuesdays, 1:45–3:45 p.m. — Room 301D")
+            self.assertTrue(sent_payload["effectId"].startswith("__bb_custom:"))
+            sent_spec = json.loads(sent_payload["effectId"][len("__bb_custom:"):])
+            self.assertEqual(sent_spec["mode"], "formatted_text")
+            self.assertEqual(
+                sent_spec["ranges"],
+                [
+                    {"start": 2, "length": 8, "styles": ["bold"]},
+                    {"start": 12, "length": 14, "styles": ["underline"]},
+                    {"start": 29, "length": 9, "styles": ["italic"]},
+                ],
+            )
+
+            edit_res = await adapter.edit_message(
+                "+15551234567",
+                "msg-rich-1",
+                "• **Thursdays**, ~~1–3 p.m.~~ __2–4 p.m.__",
+                finalize=True,
+            )
+            self.assertTrue(edit_res.success)
+            self.assertEqual(api_calls[-1][0], "/api/v1/message/msg-rich-1/edit")
+            edit_payload = api_calls[-1][1]
+            self.assertEqual(edit_payload["editedMessage"], "• Thursdays, 1–3 p.m. 2–4 p.m.")
+            self.assertTrue(edit_payload["backwardsCompatibilityMessage"].startswith("__bb_custom:"))
+            edit_spec = json.loads(edit_payload["backwardsCompatibilityMessage"][len("__bb_custom:"):])
+            self.assertEqual(edit_spec["mode"], "formatted_text")
+            self.assertEqual(edit_spec["backward_compat"], 'Edited to "• Thursdays, 1–3 p.m. 2–4 p.m."')
+            self.assertEqual(
+                edit_spec["ranges"],
+                [
+                    {"start": 2, "length": 9, "styles": ["bold"]},
+                    {"start": 13, "length": 8, "styles": ["strikethrough"]},
+                    {"start": 22, "length": 8, "styles": ["underline"]},
+                ],
+            )
+
+        asyncio.run(run_send_and_edit())
+
 
 

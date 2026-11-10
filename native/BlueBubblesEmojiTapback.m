@@ -1151,27 +1151,37 @@ static void swizzled_handleMessage(id self, SEL _cmd, id netController, NSString
 }
 
 // ---------------------------------------------------------------------------
-// macOS 26/27 (Tahoe) IMChat Edit Compatibility Shim
+// macOS 26/27 (Tahoe) IMChat Edit Compatibility Shim + Rich-Text Edit Support
 // ---------------------------------------------------------------------------
 // BlueBubblesHelperOrig.dylib calls:
 //   -[IMChat editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:]
 // On macOS 26/27+, IMChat replaced that selector with:
 //   -[IMChat editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:]
 // and requires __kIMMessagePartAttributeName on the NSAttributedString.
+// When backwardCompatText begins with "__bb_custom:", its JSON spec is decoded to apply
+// inline rich-text formatting (bold, italic, underline, strikethrough, text_effect) to
+// the edited message part, and backwardCompatabilityText is rewritten to 'Edited to "<text>"'.
+
+static IMP g_origEditMessageItem = NULL;
+
+static NSString *extractPlainString(id attrOrStr) {
+    if ([attrOrStr isKindOfClass:[NSAttributedString class]]) {
+        return ((NSAttributedString *)attrOrStr).string ?: @"";
+    }
+    if ([attrOrStr isKindOfClass:[NSString class]]) {
+        return (NSString *)attrOrStr;
+    }
+    return @"";
+}
 
 static NSAttributedString *ensureEditedPartAttributes(id attrOrStr, NSInteger partIndex) {
-    NSString *plain = nil;
+    NSString *plain = extractPlainString(attrOrStr);
     NSDictionary *existingAttrs = nil;
     if ([attrOrStr isKindOfClass:[NSAttributedString class]]) {
         NSAttributedString *as = (NSAttributedString *)attrOrStr;
-        plain = as.string ?: @"";
         if (as.length > 0) {
             existingAttrs = [as attributesAtIndex:0 effectiveRange:NULL];
         }
-    } else if ([attrOrStr isKindOfClass:[NSString class]]) {
-        plain = (NSString *)attrOrStr;
-    } else {
-        plain = @"";
     }
     NSMutableDictionary *attrs = existingAttrs
         ? [existingAttrs mutableCopy]
@@ -1190,14 +1200,71 @@ static void compat_editMessageItem(
     id newPartText,
     id backwardCompatText
 ) {
+    NSInteger normalizedPart = partIndex >= 0 ? partIndex : 0;
+    NSString *newPlain = extractPlainString(newPartText);
+    NSString *bcPlain = extractPlainString(backwardCompatText);
+
+    NSAttributedString *fixedNewText = nil;
+    NSAttributedString *fixedBcText = nil;
+
+    if ([bcPlain hasPrefix:kCustomEffectPrefix]) {
+        NSString *specJsonStr = [bcPlain substringFromIndex:kCustomEffectPrefix.length];
+        NSData *specData = [specJsonStr dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *spec = specData
+            ? [NSJSONSerialization JSONObjectWithData:specData options:0 error:nil]
+            : nil;
+        if ([spec isKindOfClass:[NSDictionary class]]) {
+            NSMutableAttributedString *attrText = [[NSMutableAttributedString alloc]
+                initWithString:newPlain
+                    attributes:@{@"__kIMMessagePartAttributeName": @(normalizedPart)}];
+            NSRange fullRange = NSMakeRange(0, attrText.length);
+            applyFormattingToRange(attrText, fullRange, spec[@"styles"], spec, spec[@"text_effect"]);
+            NSArray *ranges = [spec[@"ranges"] isKindOfClass:[NSArray class]] ? spec[@"ranges"] : nil;
+            for (id entry in ranges) {
+                if (![entry isKindOfClass:[NSDictionary class]]) {
+                    continue;
+                }
+                NSDictionary *rDict = (NSDictionary *)entry;
+                NSInteger start = [rDict[@"start"] integerValue];
+                NSInteger length = [rDict[@"length"] integerValue];
+                if (start < 0 || length <= 0) {
+                    continue;
+                }
+                applyFormattingToRange(
+                    attrText,
+                    NSMakeRange((NSUInteger)start, (NSUInteger)length),
+                    rDict[@"styles"],
+                    rDict,
+                    rDict[@"text_effect"] ?: rDict[@"effect"]
+                );
+            }
+            fixedNewText = attrText;
+        }
+        NSString *fallbackBc = [spec isKindOfClass:[NSDictionary class]] && [spec[@"backward_compat"] isKindOfClass:[NSString class]]
+            ? spec[@"backward_compat"]
+            : [NSString stringWithFormat:@"Edited to \"%@\"", newPlain];
+        fixedBcText = [[NSAttributedString alloc]
+            initWithString:fallbackBc
+                attributes:@{@"__kIMMessagePartAttributeName": @(normalizedPart)}];
+    }
+
+    if (!fixedNewText) {
+        fixedNewText = ensureEditedPartAttributes(newPartText, normalizedPart);
+    }
+    if (!fixedBcText) {
+        fixedBcText = ensureEditedPartAttributes(backwardCompatText, normalizedPart);
+    }
+
     SEL newSel = sel_registerName(
         "editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:"
     );
     if ([self respondsToSelector:newSel]) {
-        NSAttributedString *fixedNewText = ensureEditedPartAttributes(newPartText, partIndex);
-        NSAttributedString *fixedBcText = ensureEditedPartAttributes(backwardCompatText, partIndex);
         ((void(*)(id, SEL, id, NSInteger, id, id, id))objc_msgSend)(
             self, newSel, messageItem, partIndex, fixedNewText, nil, fixedBcText
+        );
+    } else if (g_origEditMessageItem != NULL) {
+        ((void(*)(id, SEL, id, NSInteger, id, id))g_origEditMessageItem)(
+            self, _cmd, messageItem, partIndex, fixedNewText, fixedBcText
         );
     }
 }
@@ -1264,8 +1331,13 @@ static void initBlueBubblesEmojiTapbackSwizzle(void) {
             SEL newEditSel = sel_registerName(
                 "editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:"
             );
-            if (![imChatCls instancesRespondToSelector:oldEditSel] &&
-                [imChatCls instancesRespondToSelector:newEditSel]) {
+            if ([imChatCls instancesRespondToSelector:oldEditSel]) {
+                Method oldEditMethod = class_getInstanceMethod(imChatCls, oldEditSel);
+                if (oldEditMethod) {
+                    g_origEditMessageItem = method_setImplementation(oldEditMethod, (IMP)compat_editMessageItem);
+                    addedEditCompat = (g_origEditMessageItem != NULL);
+                }
+            } else if ([imChatCls instancesRespondToSelector:newEditSel]) {
                 addedEditCompat = class_addMethod(
                     imChatCls, oldEditSel, (IMP)compat_editMessageItem, "v48@0:8@16q24@32@40"
                 );
