@@ -497,9 +497,11 @@ def lookup(args, **_kwargs):
 
 def register_tools(ctx):
     tapback_desc = (
-        "Add an iMessage Tapback to the current incoming BlueBubbles message only. "
-        "Supports classic tapbacks (love, like, dislike, laugh, emphasize, question) as well as any emoji "
-        "(e.g. '🔥', '🎉', '🫡', '🦄'). Requires the BlueBubbles Private API helper. Never targets another message or chat."
+        "Add an iMessage Tapback reaction to the current incoming BlueBubbles message. "
+        "Use this proactively and frequently on most turns with a creative, context-fitting single emoji "
+        "that matches the topic, humor, or vibe of the user's message (any single emoji is supported, e.g. "
+        "'🔥', '🎉', '🫡', '🦖', '🧑‍🍳', '🕵️', '💡', '🚀', '✨', as well as classic love/like/dislike/laugh/emphasize/question). "
+        "Calling this replaces the temporary thinking tapback with your chosen emoji reaction."
     )
     ctx.register_tool(
         name="bluebubbles_tapback",

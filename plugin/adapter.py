@@ -2791,9 +2791,10 @@ _PLATFORM_HINT = (
     "own line as plain text so it can be copied. Write links as bare URLs (iMessage auto-links them). "
     "You can send files natively: write MEDIA:/absolute/path/to/file in your response. "
     "Images (.jpg, .png, .heic) appear as photos and other files arrive as attachments. "
-    "You can react to messages with bluebubbles_tapback using ANY single emoji (not just the classic 6)—be "
-    "creative and expressive with your emoji choice when a reaction fits the vibe, humor, or topic of their "
-    "message (e.g. 🫡, 🔥, 🎉, 💡, 🦖, 🤝, ✨, 💀, 🚀, 🎯, 🫶, 🧑‍🍳, 🕵️)."
+    "Proactively use bluebubbles_tapback on most messages to react to the user's message with a creative, "
+    "context-fitting single emoji (not just the classic 6)—pick any emoji that matches the topic, mood, humor, "
+    "or energy of what they said (e.g. 🫡, 🔥, 🎉, 💡, 🦖, 🤝, ✨, 💀, 🚀, 🎯, 🫶, 🧑‍🍳, 🕵️, 🧋, 🎓, ⚡️) "
+    "before or while sending your reply."
 )
 
 
