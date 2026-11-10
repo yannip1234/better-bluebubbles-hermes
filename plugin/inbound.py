@@ -29,6 +29,30 @@ _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 _DM_DELIMITER = ";-;"
 _GROUP_DELIMITER = ";+;"
+_PLUGIN_PAYLOAD_UTI = "dyn.age81a5dzq7y066dbtf0g82peqf4hk2pdrb00n5xy"
+
+
+def _is_ignored_attachment(att: Any) -> bool:
+    """True for internal iMessage link-preview / balloon payload blobs (.pluginPayloadAttachment)."""
+    if not isinstance(att, dict):
+        return True
+    transfer_name = str(att.get("transferName") or att.get("filename") or "").strip().lower()
+    if transfer_name.endswith(".pluginpayloadattachment"):
+        return True
+    uti = str(att.get("uti") or "").strip().lower()
+    if uti == _PLUGIN_PAYLOAD_UTI:
+        return True
+    if att.get("hideAttachment") is True and not (att.get("mimeType") or "").strip():
+        return True
+    return False
+
+
+def _user_attachments(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only real user-visible attachments on *record*, excluding link-preview payloads."""
+    return [
+        att for att in (record.get("attachments") or [])
+        if isinstance(att, dict) and not _is_ignored_attachment(att)
+    ]
 
 
 def _chat_guid_delimiter(value: Optional[str]) -> Optional[str]:
@@ -116,7 +140,7 @@ class BlueBubblesInboundMixin:
                 response = await self._process_inbound(state.retry_payload, {}, message_id, held=state)
                 if response.status != 503 and state.accepted and all(
                         not isinstance(a, dict) or not a.get("guid") or a["guid"] in state.delivered
-                        for a in state.record.get("attachments") or []):
+                        for a in _user_attachments(state.record)):
                     state.retry_payload = None
                     return
                 if time.monotonic() >= state.attachment_deadline:
@@ -157,9 +181,7 @@ class BlueBubblesInboundMixin:
         media_types: list[str] = []
         collected: set[str] = set()
         msg_type = MessageType.TEXT
-        for att in record.get("attachments") or []:
-            if not isinstance(att, dict):
-                continue
+        for att in _user_attachments(record):
             att_guid = att.get("guid", "")
             if not att_guid or (state is not None and att_guid in state.delivered):
                 continue
@@ -314,16 +336,16 @@ class BlueBubblesInboundMixin:
         if cls._extract_retracted_ts(record) > 0 or cls._extract_edited_ts(record) > 0:
             return False
         return (event_type == "updated-message"
-                and not any(record.get(key) for key in ("text", "message", "body", "attachments")))
+                and not (any(record.get(key) for key in ("text", "message", "body")) or _user_attachments(record)))
 
     def _has_pending_inbound_content(self, message_id: Optional[str]) -> bool:
         state = self._inbound_messages.get(message_id)
         if state is None:
             return False
         if not state.accepted:
-            return any(state.record.get(key) for key in ("text", "message", "body", "attachments"))
+            return any(state.record.get(key) for key in ("text", "message", "body")) or bool(_user_attachments(state.record))
         return any(isinstance(att, dict) and att.get("guid") and att["guid"] not in state.delivered
-                   for att in state.record.get("attachments") or [])
+                   for att in _user_attachments(state.record))
 
     async def _hydrate_inbound_record(self, message_id: Optional[str]) -> dict[str, Any]:
         """Fetch routing and attachment relationships with bounded in-request retries.
@@ -349,7 +371,7 @@ class BlueBubblesInboundMixin:
                 last_record = data
                 chats = [chat for chat in (data.get("chats") or []) if isinstance(chat, dict)]
                 if chats and all(att.get("transferState") in (None, 5, "5")
-                                 for att in (data.get("attachments") or []) if isinstance(att, dict)):
+                                 for att in _user_attachments(data)):
                     return data
         if last_error is not None:
             raise last_error
@@ -416,8 +438,8 @@ class BlueBubblesInboundMixin:
         if not message_id:
             return
         state.accepted = state.accepted or self._dedup.contains(json.dumps(["message", message_id]))
-        for attachment in state.record.get("attachments") or []:
-            if isinstance(attachment, dict) and (guid := attachment.get("guid")):
+        for attachment in _user_attachments(state.record):
+            if guid := attachment.get("guid"):
                 if self._dedup.contains(json.dumps(["attachment", message_id, guid])):
                     state.delivered.add(guid)
 
@@ -518,9 +540,9 @@ class BlueBubblesInboundMixin:
         # Known unmentioned group text needs no media I/O; sparse text can still hydrate below.
         if is_group and self.require_mention and not pending_unsend and text and not self._message_matches_mention_patterns(text):
             return _ok()
-        if record.get("attachments") and not state.attachment_deadline:
+        if _user_attachments(record) and not state.attachment_deadline:
             state.attachment_deadline = time.monotonic() + _ATTACHMENT_WAIT_SECONDS
-        if (record.get("attachments") and self.client
+        if (_user_attachments(record) and self.client
                 and time.monotonic() < state.attachment_deadline):
             try:
                 async with asyncio.timeout(state.attachment_deadline - time.monotonic()):
@@ -539,8 +561,8 @@ class BlueBubblesInboundMixin:
         pending_unsend = state.accepted and retracted_ts > 0 and not state.retracted
         pending_edit = state.accepted and not pending_unsend and edited_ts > state.last_edit_ts
         media_urls, media_types, msg_type, collected = await self._collect_attachments(record, state=state)
-        attachments = {att.get("guid") for att in record.get("attachments") or []
-                       if isinstance(att, dict) and att.get("guid")} - state.delivered
+        attachments = {att.get("guid") for att in _user_attachments(record)
+                       if att.get("guid")} - state.delivered
         if not attachments <= collected:
             if not state.attachment_deadline or time.monotonic() < state.attachment_deadline:
                 self._schedule_attachment_retry(payload, state, message_id)
@@ -642,8 +664,8 @@ class BlueBubblesInboundMixin:
             state.users += 1
         try:
             async with state.lock:
-                attachments = {att.get("guid") for att in state.record.get("attachments") or []
-                               if isinstance(att, dict) and att.get("guid")}
+                attachments = {att.get("guid") for att in _user_attachments(state.record)
+                               if att.get("guid")}
                 if (state.accepted and attachments <= state.delivered
                         and not self._has_pending_edit_or_unsend(state, record)):
                     return _ok()
@@ -665,6 +687,6 @@ class BlueBubblesInboundMixin:
             task = state.retry_task
             if (state.accepted and task is not None and task is not asyncio.current_task()
                     and all(not isinstance(a, dict) or not a.get("guid") or a["guid"] in state.delivered
-                            for a in state.record.get("attachments") or [])):
+                            for a in _user_attachments(state.record))):
                 state.retry_payload = None
                 task.cancel()

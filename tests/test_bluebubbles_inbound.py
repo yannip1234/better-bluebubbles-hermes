@@ -1002,3 +1002,35 @@ class TestBlueBubblesProfileRouting:
             state=state,
         )
         assert forced == ["att-offloaded-1"]
+
+    @pytest.mark.asyncio
+    async def test_plugin_payload_link_preview_attachments_are_ignored(self, monkeypatch):
+        """iMessage URL previews attach .pluginPayloadAttachment blobs; keep message_type=TEXT so steer mode works."""
+        adapter, handled = self._capture(monkeypatch)
+        dm = {"guid": "iMessage;-;+15551234567", "chatIdentifier": "+15551234567", "style": 45}
+        resp = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                self._payload(
+                    "new-message",
+                    guid="url-msg-1",
+                    chat=dm,
+                    text="https://docs.google.com/document/d/1iS_4rjdT_slSxqpOJZKDUh-n5Aynf-xJ9sl9wjFch8s/",
+                    attachments=[
+                        {
+                            "guid": "att-preview-1",
+                            "uti": "dyn.age81a5dzq7y066dbtf0g82peqf4hk2pdrb00n5xy",
+                            "mimeType": None,
+                            "transferName": "33FBD024-2A14-47C5-A5D2-DE0095CF462D.pluginPayloadAttachment",
+                            "transferState": 5,
+                            "hideAttachment": True,
+                        }
+                    ],
+                )
+            )
+        )
+        assert resp.status == 200
+        assert len(handled) == 1
+        assert handled[0].message_type == MessageType.TEXT
+        assert handled[0].media_urls == []
+        assert handled[0].media_types == []
+        assert handled[0].text == "https://docs.google.com/document/d/1iS_4rjdT_slSxqpOJZKDUh-n5Aynf-xJ9sl9wjFch8s/"
