@@ -80,8 +80,14 @@ def _extract_poll_json_from_payload_data(raw_payload: Any) -> Optional[dict[str,
         if s.startswith("data:,"):
             with suppress(Exception):
                 return json.loads(base64.b64decode(s[6:]))
-        with suppress(Exception):
-            raw_bytes = base64.b64decode(s)
+        if len(s) % 2 == 0:
+            with suppress(Exception):
+                hex_bytes = bytes.fromhex(s)
+                if hex_bytes.startswith(b"bplist") or b"data:," in hex_bytes:
+                    raw_bytes = hex_bytes
+        if not raw_bytes:
+            with suppress(Exception):
+                raw_bytes = base64.b64decode(s)
         if not raw_bytes:
             raw_bytes = s.encode("utf-8", errors="ignore")
     elif isinstance(raw_payload, dict):

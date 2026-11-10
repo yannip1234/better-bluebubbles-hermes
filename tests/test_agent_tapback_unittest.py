@@ -27,7 +27,14 @@ from plugin.tools import (
 class ToolRuntimeTest(unittest.TestCase):
     def test_classic_and_custom_fail_closed_without_capability_contract(self):
         adapter = BlueBubblesAdapter(PlatformConfig(extra={"server_url": "http://example.invalid", "password": "fake"}))
-        adapter.client = object()
+        adapter.client = SimpleNamespace(
+            post=AsyncMock(
+                return_value=SimpleNamespace(
+                    raise_for_status=lambda: None,
+                    json=lambda: {"status": 200, "data": {"guid": "sticker-sent-1"}},
+                )
+            )
+        )
         adapter._private_api_enabled = adapter._helper_connected = True
         adapter._resolve_chat_guid = AsyncMock(return_value="iMessage;+;chat")
         adapter._post_message = AsyncMock(return_value=SendResult(success=True, message_id="reaction"))
@@ -51,7 +58,14 @@ class ToolRuntimeTest(unittest.TestCase):
 
     def test_scoped_dispatch_and_env_forgery(self):
         adapter = BlueBubblesAdapter(PlatformConfig(extra={"server_url": "http://example.invalid", "password": "fake"}))
-        adapter.client = object()
+        adapter.client = SimpleNamespace(
+            post=AsyncMock(
+                return_value=SimpleNamespace(
+                    raise_for_status=lambda: None,
+                    json=lambda: {"status": 200, "data": {"guid": "sticker-sent-1"}},
+                )
+            )
+        )
         adapter._private_api_enabled = adapter._helper_connected = True
         adapter._resolve_chat_guid = AsyncMock(return_value="iMessage;+;chat")
         adapter._post_message = AsyncMock(return_value=SendResult(success=True, message_id="reaction"))
@@ -108,7 +122,14 @@ class ToolRuntimeTest(unittest.TestCase):
 
     def test_private_api_tools_and_adapter_methods(self):
         adapter = BlueBubblesAdapter(PlatformConfig(extra={"server_url": "http://example.invalid", "password": "fake"}))
-        adapter.client = object()
+        adapter.client = SimpleNamespace(
+            post=AsyncMock(
+                return_value=SimpleNamespace(
+                    raise_for_status=lambda: None,
+                    json=lambda: {"status": 200, "data": {"guid": "sticker-sent-1"}},
+                )
+            )
+        )
         adapter._private_api_enabled = adapter._helper_connected = True
         adapter._resolve_chat_guid = AsyncMock(return_value="iMessage;+;group-1")
         adapter._post_message = AsyncMock(return_value=SendResult(success=True, message_id="msg-sent-1"))
@@ -263,10 +284,10 @@ class ToolRuntimeTest(unittest.TestCase):
                 self.assertEqual(fmt_call.args[0], "/api/v1/message/text")
                 self.assertTrue(fmt_call.args[1]["effectId"].startswith("__bb_custom:"))
                 fmt_spec = json.loads(fmt_call.args[1]["effectId"][len("__bb_custom:"):])
-                self.assertEqual(fmt_spec["type"], "styled_text")
+                self.assertEqual(fmt_spec["mode"], "formatted_text")
                 self.assertEqual(fmt_spec["styles"], ["bold", "italic"])
-                self.assertEqual(fmt_spec["text_effect"], 12)
-                self.assertEqual(fmt_spec["ranges"][0]["text_effect"], 1)
+                self.assertEqual(fmt_spec["text_effect"], "explode")
+                self.assertEqual(fmt_spec["ranges"][0]["text_effect"], "ripple")
 
                 # 9. Send Later
                 res_later = json.loads(
@@ -281,9 +302,9 @@ class ToolRuntimeTest(unittest.TestCase):
                 self.assertTrue(res_later["success"])
                 later_call = adapter._post_message.await_args_list[-1]
                 later_spec = json.loads(later_call.args[1]["effectId"][len("__bb_custom:"):])
-                self.assertEqual(later_spec["type"], "send_later")
+                self.assertEqual(later_spec["mode"], "send_later")
                 self.assertEqual(later_spec["styles"], ["bold"])
-                self.assertGreater(later_spec["scheduled_at_ms"], 1000000000000)
+                self.assertGreater(later_spec["scheduled_at"], 1000000000)
 
                 # Past date must fail validation
                 self.assertFalse(
@@ -304,17 +325,15 @@ class ToolRuntimeTest(unittest.TestCase):
                 self.assertEqual(len(res_poll["options"]), 3)
                 poll_call = adapter._post_message.await_args_list[-1]
                 poll_spec = json.loads(poll_call.args[1]["effectId"][len("__bb_custom:"):])
-                self.assertEqual(poll_spec["type"], "poll_create")
+                self.assertEqual(poll_spec["mode"], "poll_create")
                 self.assertEqual(poll_spec["title"], "Dinner tonight?")
 
-                first_opt_id = res_poll["options"][0]["identifier"]
                 res_vote = json.loads(
                     poll(
                         {
                             "action": "vote",
-                            "poll_message_guid": "poll-guid-1",
-                            "option_id": first_opt_id,
-                            "option_text": "Tacos",
+                            "message_id": "poll-guid-1",
+                            "option": "Tacos",
                         }
                     )
                 )
@@ -322,15 +341,16 @@ class ToolRuntimeTest(unittest.TestCase):
                 vote_spec = json.loads(
                     adapter._post_message.await_args_list[-1].args[1]["effectId"][len("__bb_custom:"):]
                 )
-                self.assertEqual(vote_spec["type"], "poll_vote")
+                self.assertEqual(vote_spec["mode"], "poll_vote")
                 self.assertEqual(vote_spec["poll_guid"], "poll-guid-1")
+                self.assertEqual(vote_spec["option"], "Tacos")
 
                 res_add_opt = json.loads(
                     poll(
                         {
                             "action": "add_option",
-                            "poll_message_guid": "poll-guid-1",
-                            "option_text": "Ramen",
+                            "message_id": "poll-guid-1",
+                            "option": "Ramen",
                         }
                     )
                 )
@@ -338,8 +358,8 @@ class ToolRuntimeTest(unittest.TestCase):
                 add_opt_spec = json.loads(
                     adapter._post_message.await_args_list[-1].args[1]["effectId"][len("__bb_custom:"):]
                 )
-                self.assertEqual(add_opt_spec["type"], "poll_add_option")
-                self.assertEqual(add_opt_spec["text"], "Ramen")
+                self.assertEqual(add_opt_spec["mode"], "poll_add_option")
+                self.assertEqual(add_opt_spec["option_text"], "Ramen")
 
                 # 11. Sticker tapbacks, freeform overlay, and standalone stickers
                 import tempfile
@@ -351,30 +371,29 @@ class ToolRuntimeTest(unittest.TestCase):
                         sticker({"mode": "tapback", "file_path": tmp_sticker.name})
                     )
                     self.assertTrue(res_st_tapback["success"])
-                    st_tb_spec = json.loads(
-                        adapter._post_message.await_args_list[-1].args[1]["effectId"][len("__bb_custom:"):]
-                    )
-                    self.assertEqual(st_tb_spec["type"], "sticker_send")
-                    self.assertEqual(st_tb_spec["mode"], "tapback")
-                    self.assertEqual(st_tb_spec["selected_guid"], "inbound-msg-1")
+                    st_tb_form = adapter.client.post.await_args_list[-1].kwargs["data"]
+                    st_tb_spec = json.loads(st_tb_form["effectId"][len("__bb_custom:"):])
+                    self.assertEqual(st_tb_spec["mode"], "sticker_tapback")
+                    self.assertTrue(st_tb_spec["is_tapback"])
+                    self.assertEqual(st_tb_form["selectedMessageGuid"], "inbound-msg-1")
 
                     res_st_overlay = json.loads(
                         sticker(
                             {
                                 "mode": "overlay",
                                 "file_path": tmp_sticker.name,
-                                "x": 0.35,
-                                "y": 0.65,
+                                "x_scalar": 0.35,
+                                "y_scalar": 0.65,
                                 "scale": 1.2,
                                 "rotation": 15.0,
                             }
                         )
                     )
                     self.assertTrue(res_st_overlay["success"])
-                    st_ov_spec = json.loads(
-                        adapter._post_message.await_args_list[-1].args[1]["effectId"][len("__bb_custom:"):]
-                    )
-                    self.assertEqual(st_ov_spec["mode"], "overlay")
+                    st_ov_form = adapter.client.post.await_args_list[-1].kwargs["data"]
+                    st_ov_spec = json.loads(st_ov_form["effectId"][len("__bb_custom:"):])
+                    self.assertEqual(st_ov_spec["mode"], "sticker")
+                    self.assertFalse(st_ov_spec["is_tapback"])
                     self.assertAlmostEqual(st_ov_spec["x_scalar"], 0.35)
                     self.assertAlmostEqual(st_ov_spec["y_scalar"], 0.65)
             finally:

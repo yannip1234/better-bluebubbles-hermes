@@ -43,6 +43,9 @@ with _profile_runtime_scope(profile, hydrate_secrets=False):
             'bluebubbles_edit_message',
             'bluebubbles_unsend_message',
             'bluebubbles_send_effect',
+            'bluebubbles_send_later',
+            'bluebubbles_poll',
+            'bluebubbles_sticker',
             'bluebubbles_chat_action',
             'bluebubbles_lookup',
         }
