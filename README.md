@@ -120,8 +120,8 @@ hermes bluebubbles-config sync --restart
 
 When two Hermes profiles connect to the same BlueBubbles server, BlueBubbles delivers every webhook event to both profiles. The adapter scopes each profile using `allowed_chat_guids`, `ignore_direct_messages`, `ignore_group_messages`, and `home_channel`:
 
-- Chat GUIDs containing `;+;` are group chats (for example `any;+;74ca28f2630d48908a8b72a9d3865376` or `iMessage;+;74ca28f2630d48908a8b72a9d3865376`).
-- Chat GUIDs containing `;-;` are direct messages (for example `any;-;+16179431941` or `iMessage;-;+16179431941`).
+- Chat GUIDs containing `;+;` are group chats (for example `any;+;chat0123456789abcdef0123456789ab` or `iMessage;+;chat0123456789abcdef0123456789ab`).
+- Chat GUIDs containing `;-;` are direct messages (for example `any;-;+15551234567` or `iMessage;-;+15551234567`).
 - Service prefixes (`any`, `iMessage`, `SMS`, or a leading `;-;` / `;+;`) match the same chat identifier while keeping DMs and groups separate.
 - If a profile sets `home_channel.chat_id` or `allowed_chat_guids` to only `;-;` DM GUIDs, `ignore_group_messages` defaults to `true`.
 - If a profile sets `home_channel.chat_id` or `allowed_chat_guids` to only `;+;` group GUIDs, `ignore_direct_messages` defaults to `true`.
@@ -135,11 +135,11 @@ platforms:
     enabled: true
     home_channel:
       platform: bluebubbles
-      chat_id: any;+;74ca28f2630d48908a8b72a9d3865376
+      chat_id: any;+;chat0123456789abcdef0123456789ab
     extra:
       require_mention: false
       allowed_chat_guids:
-        - "any;+;74ca28f2630d48908a8b72a9d3865376"
+        - "any;+;chat0123456789abcdef0123456789ab"
       ignore_direct_messages: true
 ```
 
@@ -152,11 +152,11 @@ platforms:
   bluebubbles:
     enabled: true
     allowed_users:
-      - "yannipang@icloud.com"
-      - "+16179431941"
+      - "user@icloud.com"
+      - "+15551234567"
     home_channel:
       platform: bluebubbles
-      chat_id: "any;-;+16179431941"
+      chat_id: "any;-;+15551234567"
     extra:
       require_mention: false
 ```

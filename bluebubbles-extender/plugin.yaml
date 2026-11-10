@@ -9,7 +9,7 @@ description: >
   and group (;+;) chat routing, live chat and contact pickers, wake-word and
   read-receipt controls, webhook settings, Private API diagnostics, plugin
   deployment sync, and gateway restart.
-author: Yanni Pang
+author: NousResearch
 provides_tools: []
 provides_hooks: []
 config_keys:

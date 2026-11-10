@@ -740,7 +740,7 @@
             ),
             h(TagListEditor, {
               items: eff.allowed_chat_guids || [],
-              placeholder: "any;+;74ca28f2630d48908a8b72a9d3865376 or any;-;+16179431941",
+              placeholder: "any;+;chat0123456789abcdef0123456789ab or any;-;+15551234567",
               emptyText: "No chat GUID filter set — any chat matching the DM/Group toggles above is allowed.",
               onChange: function (next) { updateField("allowed_chat_guids", next); },
               extraButton: h(Button, {
@@ -858,7 +858,7 @@
             ),
             h(TagListEditor, {
               items: eff.allowed_users || [],
-              placeholder: "+16179431941, yannipang@icloud.com",
+              placeholder: "+15551234567, user@icloud.com",
               emptyText: eff.allow_all_users
                 ? "Allow All Senders is enabled above."
                 : "No allowed users set — add phone numbers or Apple ID emails.",
@@ -931,7 +931,7 @@
             ),
             h(Input, {
               value: eff.home_channel || "",
-              placeholder: "any;-;+16179431941 or any;+;74ca28f2630d48908a8b72a9d3865376",
+              placeholder: "any;-;+15551234567 or any;+;chat0123456789abcdef0123456789ab",
               onChange: function (e) { updateField("home_channel", e.target.value); },
             }),
             h("div", { className: "bbx-help" },

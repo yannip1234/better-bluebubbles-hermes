@@ -612,14 +612,14 @@ function RoutingPage({ store }) {
       jsx(ListRow, {
         title: 'Allowed Chat GUIDs',
         description:
-          'One chat GUID per line (or comma-separated). Supports exact GUIDs (any;+;74ca28f2630d48908a8b72a9d3865376) or DM handles (any;-;+16179431941). Leave empty to allow all chats permitted by the toggles above.',
+          'One chat GUID per line (or comma-separated). Supports exact GUIDs (any;+;chat0123456789abcdef0123456789ab) or DM handles (any;-;+15551234567). Leave empty to allow all chats permitted by the toggles above.',
         wide: true,
         below: jsxs('div', {
           className: 'mt-2 space-y-2',
           children: [
             jsx(Textarea, {
               className: 'min-h-24 font-mono text-xs',
-              placeholder: 'any;+;74ca28f2630d48908a8b72a9d3865376\nany;-;+16179431941',
+              placeholder: 'any;+;chat0123456789abcdef0123456789ab\nany;-;+15551234567',
               value: guidsText,
               onChange: e => {
                 const raw = e.currentTarget.value
@@ -710,7 +710,7 @@ function RoutingPage({ store }) {
         description: 'Default destination for cron job deliveries and proactive notifications.',
         action: jsx(Input, {
           className: 'w-72 font-mono text-xs',
-          placeholder: 'any;+;74ca28f2630d48908a8b72a9d3865376',
+          placeholder: 'any;+;chat0123456789abcdef0123456789ab',
           value: d.home_channel || '',
           onChange: e => store.updateDraft({ home_channel: e.currentTarget.value })
         })
@@ -775,14 +775,14 @@ function AccessPage({ store }) {
       jsx(ListRow, {
         title: 'Allowed Senders (Phone Numbers / Apple IDs)',
         description:
-          'One phone number (+16179431941) or email (user@icloud.com) per line, or comma-separated.',
+          'One phone number (+15551234567) or email (user@icloud.com) per line, or comma-separated.',
         wide: true,
         below: jsxs('div', {
           className: 'mt-2 space-y-2',
           children: [
             jsx(Textarea, {
               className: 'min-h-24 font-mono text-xs',
-              placeholder: '+16179431941\nyannipang@icloud.com',
+              placeholder: '+15551234567\nuser@icloud.com',
               value: usersText,
               onChange: e => {
                 const raw = e.currentTarget.value

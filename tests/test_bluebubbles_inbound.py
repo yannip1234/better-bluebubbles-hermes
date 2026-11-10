@@ -783,20 +783,20 @@ class TestBlueBubblesProfileRouting:
             "enabled": True,
             "home_channel": {
                 "platform": "bluebubbles",
-                "chat_id": "any;+;74ca28f2630d48908a8b72a9d3865376",
+                "chat_id": "any;+;chat0123456789abcdef0123456789ab",
             },
             "extra": {
                 "require_mention": False,
-                "allowed_chat_guids": ["any;+;74ca28f2630d48908a8b72a9d3865376"],
+                "allowed_chat_guids": ["any;+;chat0123456789abcdef0123456789ab"],
                 "ignore_direct_messages": True,
             },
         }
         personal_cfg = {
             "enabled": True,
-            "allowed_users": ["yannipang@icloud.com", "+16179431941"],
+            "allowed_users": ["user@icloud.com", "+15551234567"],
             "home_channel": {
                 "platform": "bluebubbles",
-                "chat_id": "any;-;+16179431941",
+                "chat_id": "any;-;+15551234567",
             },
             "extra": {
                 "require_mention": False,
@@ -827,60 +827,60 @@ class TestBlueBubblesProfileRouting:
             family_adapter._private_api_enabled = True
             personal_adapter._private_api_enabled = True
 
-            # 1. Inbound DM from +16179431941 broadcast to both profiles -> only personal accepts.
+            # 1. Inbound DM from +15551234567 broadcast to both profiles -> only personal accepts.
             dm_payload = self._payload(
                 "new-message",
                 guid="dm-1",
-                chat={"guid": "any;-;+16179431941", "style": 45, "chatIdentifier": "+16179431941"},
-                handle={"address": "+16179431941"},
+                chat={"guid": "any;-;+15551234567", "style": 45, "chatIdentifier": "+15551234567"},
+                handle={"address": "+15551234567"},
                 text="hello personal",
             )
             assert (await family_adapter._handle_webhook(_FakeBlueBubblesRequest(dm_payload))).status == 200
             assert (await personal_adapter._handle_webhook(_FakeBlueBubblesRequest(dm_payload))).status == 200
             assert family_handled == []
             assert [(e.source.chat_id, e.source.chat_type, e.text) for e in personal_handled] == [
-                ("+16179431941", "dm", "hello personal")
+                ("+15551234567", "dm", "hello personal")
             ]
 
-            # Reply from personal goes to any;-;+16179431941; family refuses to send to DM.
+            # Reply from personal goes to any;-;+15551234567; family refuses to send to DM.
             assert (await personal_adapter.send(personal_handled[0].source.chat_id, "personal reply")).success
-            assert not (await family_adapter.send("+16179431941", "wrong profile reply")).success
-            assert not (await family_adapter.send("any;-;+16179431941", "wrong profile reply")).success
-            assert sent_by_profile["personal"] == ["any;-;+16179431941"]
+            assert not (await family_adapter.send("+15551234567", "wrong profile reply")).success
+            assert not (await family_adapter.send("any;-;+15551234567", "wrong profile reply")).success
+            assert sent_by_profile["personal"] == ["any;-;+15551234567"]
             assert sent_by_profile["family"] == []
 
-            # 2. Inbound family group message from +16179431941 broadcast to both -> only family accepts.
+            # 2. Inbound family group message from +15551234567 broadcast to both -> only family accepts.
             group_payload = self._payload(
                 "new-message",
                 guid="grp-1",
                 chat={
-                    "guid": "iMessage;+;74ca28f2630d48908a8b72a9d3865376",
+                    "guid": "iMessage;+;chat0123456789abcdef0123456789ab",
                     "style": 43,
-                    "chatIdentifier": "74ca28f2630d48908a8b72a9d3865376",
+                    "chatIdentifier": "chat0123456789abcdef0123456789ab",
                 },
-                handle={"address": "+16179431941"},
+                handle={"address": "+15551234567"},
                 text="hello family",
             )
             assert (await family_adapter._handle_webhook(_FakeBlueBubblesRequest(group_payload))).status == 200
             assert (await personal_adapter._handle_webhook(_FakeBlueBubblesRequest(group_payload))).status == 200
             assert len(personal_handled) == 1  # unchanged
             assert [(e.source.chat_id, e.source.chat_type, e.text) for e in family_handled] == [
-                ("iMessage;+;74ca28f2630d48908a8b72a9d3865376", "group", "hello family")
+                ("iMessage;+;chat0123456789abcdef0123456789ab", "group", "hello family")
             ]
 
             # Reply from family goes to the group chat GUID; personal refuses to send to group chat.
             assert (await family_adapter.send(family_handled[0].source.chat_id, "family reply")).success
-            assert not (await personal_adapter.send("any;+;74ca28f2630d48908a8b72a9d3865376", "leak")).success
-            assert not (await personal_adapter.send(";+;74ca28f2630d48908a8b72a9d3865376", "leak")).success
-            assert sent_by_profile["family"] == ["iMessage;+;74ca28f2630d48908a8b72a9d3865376"]
-            assert sent_by_profile["personal"] == ["any;-;+16179431941"]
+            assert not (await personal_adapter.send("any;+;chat0123456789abcdef0123456789ab", "leak")).success
+            assert not (await personal_adapter.send(";+;chat0123456789abcdef0123456789ab", "leak")).success
+            assert sent_by_profile["family"] == ["iMessage;+;chat0123456789abcdef0123456789ab"]
+            assert sent_by_profile["personal"] == ["any;-;+15551234567"]
 
             # 3. Inbound message from an unconfigured group chat is ignored by both profiles.
             other_group_payload = self._payload(
                 "new-message",
                 guid="grp-other",
                 chat={"guid": "any;+;deadbeefdeadbeefdeadbeefdeadbeef", "style": 43},
-                handle={"address": "+16179431941"},
+                handle={"address": "+15551234567"},
                 text="other group",
             )
             assert (await family_adapter._handle_webhook(_FakeBlueBubblesRequest(other_group_payload))).status == 200
@@ -892,8 +892,8 @@ class TestBlueBubblesProfileRouting:
     @pytest.mark.asyncio
     async def test_resolve_chat_guid_strictly_separates_dm_and_group_delimiters(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, send_read_receipts=False, require_mention=False)
-        address = "+16179431941"
-        group_id = "74ca28f2630d48908a8b72a9d3865376"
+        address = "+15551234567"
+        group_id = "chat0123456789abcdef0123456789ab"
         chats = [
             # Group chat appearing first with a colliding identifier must never match a DM lookup.
             {"guid": f"iMessage;+;{address}", "style": 43, "chatIdentifier": address},

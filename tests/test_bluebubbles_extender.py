@@ -77,10 +77,10 @@ class BlueBubblesExtenderTest(unittest.TestCase):
                 "platform_enabled": True,
                 "plugin_enabled": True,
                 "toolsets_enabled": True,
-                "allowed_chat_guids": ["any;+;74ca28f2630d48908a8b72a9d3865376"],
+                "allowed_chat_guids": ["any;+;chat0123456789abcdef0123456789ab"],
                 "ignore_direct_messages": True,
                 "ignore_group_messages": False,
-                "home_channel": "any;+;74ca28f2630d48908a8b72a9d3865376",
+                "home_channel": "any;+;chat0123456789abcdef0123456789ab",
                 "home_channel_name": "Family Group",
                 "require_mention": False,
                 "send_read_receipts": True,
@@ -90,7 +90,7 @@ class BlueBubblesExtenderTest(unittest.TestCase):
         eff = updated_family["effective"]
         self.assertEqual(eff["server_url"], "http://127.0.0.1:1234")
         self.assertEqual(eff["password"], self.cs.PASSWORD_MASK)
-        self.assertEqual(eff["allowed_chat_guids"], ["any;+;74ca28f2630d48908a8b72a9d3865376"])
+        self.assertEqual(eff["allowed_chat_guids"], ["any;+;chat0123456789abcdef0123456789ab"])
         self.assertTrue(eff["ignore_direct_messages"])
         self.assertFalse(eff["ignore_group_messages"])
         self.assertEqual(updated_family["meta"]["routing_mode"], "group_only")
@@ -116,8 +116,8 @@ class BlueBubblesExtenderTest(unittest.TestCase):
         updated_personal = self.cs.write_profile_settings(
             "personal",
             {
-                "allowed_users": ["+16179431941", "yannipang@icloud.com"],
-                "home_channel": "any;-;+16179431941",
+                "allowed_users": ["+15551234567", "user@icloud.com"],
+                "home_channel": "any;-;+15551234567",
                 "ignore_group_messages": True,
                 "suppress_restart_push": True,
             },
@@ -125,7 +125,7 @@ class BlueBubblesExtenderTest(unittest.TestCase):
         )
         self.assertEqual(updated_personal["meta"]["routing_mode"], "dm_only")
         self.assertTrue(updated_personal["effective"]["suppress_restart_push"])
-        self.assertEqual(updated_personal["effective"]["allowed_users"], ["+16179431941", "yannipang@icloud.com"])
+        self.assertEqual(updated_personal["effective"]["allowed_users"], ["+15551234567", "user@icloud.com"])
 
     def test_sync_connector_plugin(self) -> None:
         res = self.cs.sync_connector_plugin(["family", "personal"], root=self.root)
@@ -157,7 +157,7 @@ class BlueBubblesExtenderTest(unittest.TestCase):
             payload = api_mod.SaveSettingsPayload(
                 target_profile="family",
                 settings={
-                    "allowed_chat_guids": ["any;+;74ca28f2630d48908a8b72a9d3865376"],
+                    "allowed_chat_guids": ["any;+;chat0123456789abcdef0123456789ab"],
                     "ignore_direct_messages": True,
                 },
                 sync_dotenv=True,
@@ -190,14 +190,14 @@ class BlueBubblesExtenderTest(unittest.TestCase):
             {
                 "server_url": "http://127.0.0.1:1234",
                 "ignore_group_messages": True,
-                "allowed_users": ["+16179431941"],
+                "allowed_users": ["+15551234567"],
             },
             root=self.root,
         )
         cfg = self.cs._load_yaml_file(self.root / "profiles" / "personal" / "config.yaml")
         ext_entry = cfg.get("plugins", {}).get("entries", {}).get("bluebubbles-extender", {}).get("settings", {})
         self.assertTrue(ext_entry.get("ignore_group_messages"))
-        self.assertEqual(ext_entry.get("allowed_users"), ["+16179431941"])
+        self.assertEqual(ext_entry.get("allowed_users"), ["+15551234567"])
 
 
 if __name__ == "__main__":

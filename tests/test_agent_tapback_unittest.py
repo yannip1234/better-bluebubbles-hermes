@@ -134,7 +134,7 @@ class ToolRuntimeTest(unittest.TestCase):
         adapter._resolve_chat_guid = AsyncMock(return_value="iMessage;+;group-1")
         adapter._post_message = AsyncMock(return_value=SendResult(success=True, message_id="msg-sent-1"))
         adapter._api_put = AsyncMock(return_value={"status": 200, "data": {"displayName": "New Group"}})
-        adapter._api_post = AsyncMock(return_value={"status": 200, "data": [{"handle": "+16179431941"}]})
+        adapter._api_post = AsyncMock(return_value={"status": 200, "data": [{"handle": "+15551234567"}]})
         adapter._api_delete = AsyncMock(return_value={"status": 200})
         adapter._api_get = AsyncMock(
             side_effect=lambda path: (
@@ -237,27 +237,27 @@ class ToolRuntimeTest(unittest.TestCase):
                 )
                 self.assertTrue(
                     json.loads(
-                        chat_action({"action": "add_participant", "address": "+16179431941"})
+                        chat_action({"action": "add_participant", "address": "+15551234567"})
                     )["success"]
                 )
                 self.assertTrue(
                     json.loads(
-                        chat_action({"action": "remove_participant", "address": "+16179431941"})
+                        chat_action({"action": "remove_participant", "address": "+15551234567"})
                     )["success"]
                 )
                 self.assertTrue(json.loads(chat_action({"action": "remove_group_icon"}))["success"])
                 self.assertTrue(json.loads(chat_action({"action": "leave_group"}))["success"])
 
                 # 7. Lookups: focus_status, availability, FindMy
-                res_focus = json.loads(lookup({"query": "focus_status", "address": "+16179431941"}))
+                res_focus = json.loads(lookup({"query": "focus_status", "address": "+15551234567"}))
                 self.assertTrue(res_focus["success"])
                 self.assertEqual(res_focus["status"], "silenced")
 
-                res_imsg = json.loads(lookup({"query": "imessage_availability", "address": "+16179431941"}))
+                res_imsg = json.loads(lookup({"query": "imessage_availability", "address": "+15551234567"}))
                 self.assertTrue(res_imsg["success"])
                 self.assertTrue(res_imsg["available"])
 
-                res_ft = json.loads(lookup({"query": "facetime_availability", "address": "+16179431941"}))
+                res_ft = json.loads(lookup({"query": "facetime_availability", "address": "+15551234567"}))
                 self.assertTrue(res_ft["success"])
                 self.assertTrue(res_ft["available"])
 
@@ -407,35 +407,35 @@ class ToolRuntimeTest(unittest.TestCase):
 
         contacts_payload = [
             {
-                "firstName": "Dominik",
-                "lastName": "Airey",
-                "displayName": "Dominik Airey",
-                "phoneNumbers": [{"address": "+1 (781) 354-2095"}],
-                "emails": [{"address": "inkdo2@gmail.com"}],
+                "firstName": "Alice",
+                "lastName": "Example",
+                "displayName": "Alice Example",
+                "phoneNumbers": [{"address": "+1 (555) 234-5678"}],
+                "emails": [{"address": "alice@example.com"}],
             },
             {
-                "firstName": "Ian",
-                "lastName": "Pang",
-                "displayName": "Ian Pang",
-                "phoneNumbers": [{"address": "+16178035651"}],
+                "firstName": "Bob",
+                "lastName": "Sample",
+                "displayName": "Bob Sample",
+                "phoneNumbers": [{"address": "+15558765432"}],
                 "emails": [],
             },
         ]
         raw_locations = [
             {
-                "handle": "+17813542095",
-                "coordinates": [42.50547, -71.10775],
-                "short_address": "318 South St, Reading, MA",
-                "long_address": "318 South St, Reading, MA 01867, United States",
+                "handle": "+15552345678",
+                "coordinates": [37.3349, -122.0090],
+                "short_address": "1 Apple Park Way, Cupertino, CA",
+                "long_address": "1 Apple Park Way, Cupertino, CA 95014, United States",
                 "title": None,
                 "status": "shallow",
                 "last_updated": 1793992234000,
             },
             {
-                "handle": "+16178035651",
-                "coordinates": [42.35046, -71.04524],
-                "short_address": "127 Autumn Ln, Boston, MA",
-                "long_address": "127 Autumn Ln, Boston, MA 02210, United States",
+                "handle": "+15558765432",
+                "coordinates": [37.7749, -122.4194],
+                "short_address": "100 Market St, San Francisco, CA",
+                "long_address": "100 Market St, San Francisco, CA 94105, United States",
                 "title": None,
                 "status": "shallow",
                 "last_updated": 1793992234000,
@@ -456,18 +456,18 @@ class ToolRuntimeTest(unittest.TestCase):
             res_all = asyncio.run(adapter.get_findmy_locations("friends", refresh=False))
             self.assertTrue(res_all["success"])
             self.assertEqual(len(res_all["data"]), 2)
-            self.assertEqual(res_all["data"][0]["display_name"], "Dominik Airey")
-            self.assertEqual(res_all["data"][0]["title"], "Dominik Airey")
+            self.assertEqual(res_all["data"][0]["display_name"], "Alice Example")
+            self.assertEqual(res_all["data"][0]["title"], "Alice Example")
             self.assertEqual(len(pushed), 2)
 
             res_filtered = asyncio.run(
-                adapter.get_findmy_locations("friends", refresh=True, address="Dominik")
+                adapter.get_findmy_locations("friends", refresh=True, address="Alice")
             )
             self.assertTrue(res_filtered["success"])
             self.assertEqual(len(res_filtered["data"]), 1)
-            self.assertEqual(res_filtered["data"][0]["handle"], "+17813542095")
-            self.assertEqual(res_filtered["data"][0]["display_name"], "Dominik Airey")
-            self.assertIn("Reading, MA", res_filtered["data"][0]["short_address"])
+            self.assertEqual(res_filtered["data"][0]["handle"], "+15552345678")
+            self.assertEqual(res_filtered["data"][0]["display_name"], "Alice Example")
+            self.assertIn("Cupertino, CA", res_filtered["data"][0]["short_address"])
 
     def test_turn_working_placeholder_progress_rollover_and_final_morph(self):
         from gateway.platforms.event import MessageEvent, MessageType
@@ -631,7 +631,7 @@ class ToolRuntimeTest(unittest.TestCase):
         async def scenario():
             source = adapter.build_source(chat_id="+15551234567", chat_type="dm", user_id="+15551234567")
             event = MessageEvent(
-                text="check piazza for office hours",
+                text="check the schedule for office hours",
                 message_type=MessageType.TEXT,
                 source=source,
                 message_id="user-msg-101",
@@ -654,17 +654,17 @@ class ToolRuntimeTest(unittest.TestCase):
                 # Thinking/progress output creates bubble-1 and edits it in place
                 r1 = await adapter.send(
                     "+15551234567",
-                    "💭 Checking Piazza for COMS W4731 office hours...",
+                    "💭 Checking the schedule for office hours...",
                     metadata={"_interim_send": True},
                 )
                 self.assertTrue(r1.success)
                 self.assertEqual(api_calls[-1][0], "/api/v1/message/text")
-                self.assertEqual(api_calls[-1][1]["message"], "💭 Checking Piazza for COMS W4731 office hours...")
+                self.assertEqual(api_calls[-1][1]["message"], "💭 Checking the schedule for office hours...")
 
                 r2 = await adapter.edit_message(
                     "+15551234567",
                     "bubble-1",
-                    "💭 Checking Piazza for COMS W4731 office hours...\n🌐 Searching Piazza...",
+                    "💭 Checking the schedule for office hours...\n🌐 Searching schedule...",
                     metadata={"_interim_send": True},
                 )
                 self.assertTrue(r2.success)
@@ -673,7 +673,7 @@ class ToolRuntimeTest(unittest.TestCase):
                 # Final reply removes 🧠 tapback (-🧠) and edits bubble-1 in place!
                 final_res = await adapter.send(
                     "+15551234567",
-                    "Progga's office hours are Tue 1:45-3:45pm and Thu 1-3pm.",
+                    "Office hours are Tue 2-4pm and Thu 1-3pm.",
                     metadata={"notify": True},
                 )
                 self.assertTrue(final_res.success)
@@ -682,7 +682,7 @@ class ToolRuntimeTest(unittest.TestCase):
                 self.assertEqual(api_calls[-1][0], "/api/v1/message/bubble-1/edit")
                 self.assertEqual(
                     api_calls[-1][1]["editedMessage"],
-                    "Progga's office hours are Tue 1:45-3:45pm and Thu 1-3pm.",
+                    "Office hours are Tue 2-4pm and Thu 1-3pm.",
                 )
 
             with patch.object(

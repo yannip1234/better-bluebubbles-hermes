@@ -118,7 +118,7 @@ SETTINGS_SCHEMA: list[dict[str, Any]] = [
         "section": "routing",
         "type": "list",
         "default": [],
-        "placeholder": "any;+;74ca28f2630d48908a8b72a9d3865376, any;-;+16179431941",
+        "placeholder": "any;+;chat0123456789abcdef0123456789ab, any;-;+15551234567",
         "description": "Restrict this profile to specific chat GUIDs (;-; for DMs, ;+; for group chats). Leave empty to allow any chat matching the DM/group toggles.",
     },
     {
@@ -149,7 +149,7 @@ SETTINGS_SCHEMA: list[dict[str, Any]] = [
         "section": "access",
         "type": "list",
         "default": [],
-        "placeholder": "+16179431941, user@icloud.com",
+        "placeholder": "+15551234567, user@icloud.com",
         "description": "Phone numbers (E.164) or Apple ID emails allowed to talk to the bot.",
     },
     {
@@ -170,7 +170,7 @@ SETTINGS_SCHEMA: list[dict[str, Any]] = [
         "section": "home",
         "type": "string",
         "default": "",
-        "placeholder": "any;-;+16179431941 or any;+;74ca28f2630d48908a8b72a9d3865376",
+        "placeholder": "any;-;+15551234567 or any;+;chat0123456789abcdef0123456789ab",
         "description": "Default iMessage chat GUID or handle for cron job delivery and notifications.",
     },
     {
