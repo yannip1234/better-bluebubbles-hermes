@@ -68,6 +68,20 @@ _WEBHOOK_MAX_BODY_BYTES = 1_048_576
 DEFAULT_WEBHOOK_PORT = 8645
 DEFAULT_WEBHOOK_PATH = "/bluebubbles-webhook"
 MAX_TEXT_LENGTH = 4000
+_IMESSAGE_MAX_EDITS = 5
+_IMESSAGE_EDIT_WINDOW_SECONDS = 840.0  # 14m safety margin under Apple's 15m edit window
+DEFAULT_WORKING_PLACEHOLDER_TEXT = "⏳ Working on it..."
+DEFAULT_WORKING_PLACEHOLDER_DELAY = 2.0
+
+
+def _turn_chat_key(value: Optional[str]) -> str:
+    """Canonical turn-progress key unifying bare DM handles and full chat GUIDs."""
+    _service, delimiter, identifier = _split_chat_guid(value)
+    if not identifier:
+        return ""
+    if delimiter == _GROUP_DELIMITER:
+        return f"{_GROUP_DELIMITER}{identifier.lower()}"
+    return f"{_DM_DELIMITER}{identifier.lower()}"
 
 # iMessage has no stable bot mention identity (unlike <@U...>/@botname/MXID), so
 # `require_mention: true` without custom aliases uses Hermes wake words.
@@ -528,6 +542,39 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                         group_chats.append(candidate)
             self.config.extra["group_allowed_chats"] = group_chats
 
+        raw_working_placeholder = (
+            extra.get("working_placeholder")
+            if "working_placeholder" in extra
+            else _get_scoped_secret("BLUEBUBBLES_WORKING_PLACEHOLDER")
+        )
+        parsed_working_placeholder = _parse_optional_bool(raw_working_placeholder)
+        self.working_placeholder_enabled: bool = (
+            True if parsed_working_placeholder is None else parsed_working_placeholder
+        )
+        raw_placeholder_delay = (
+            extra.get("working_placeholder_delay")
+            if "working_placeholder_delay" in extra
+            else _get_scoped_secret("BLUEBUBBLES_WORKING_PLACEHOLDER_DELAY")
+        )
+        try:
+            self.working_placeholder_delay: float = (
+                float(raw_placeholder_delay)
+                if raw_placeholder_delay is not None and str(raw_placeholder_delay).strip() != ""
+                else DEFAULT_WORKING_PLACEHOLDER_DELAY
+            )
+        except (TypeError, ValueError):
+            self.working_placeholder_delay = DEFAULT_WORKING_PLACEHOLDER_DELAY
+        raw_placeholder_text = (
+            extra.get("working_placeholder_text")
+            if "working_placeholder_text" in extra
+            else _get_scoped_secret("BLUEBUBBLES_WORKING_PLACEHOLDER_TEXT")
+        )
+        self.working_placeholder_text: str = (
+            str(raw_placeholder_text).strip()
+            if raw_placeholder_text and str(raw_placeholder_text).strip()
+            else DEFAULT_WORKING_PLACEHOLDER_TEXT
+        )
+
         self.client: Optional[httpx.AsyncClient] = None
         self._runner = None
         self._private_api_enabled: Optional[bool] = None
@@ -539,6 +586,14 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         self._sent_tapbacks: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._sent_messages: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._last_sent_by_chat: OrderedDict[str, str] = OrderedDict()
+        self._message_edit_counts: OrderedDict[str, int] = OrderedDict()
+        self._message_sent_at: OrderedDict[str, float] = OrderedDict()
+        self._replaced_message_ids: OrderedDict[str, str] = OrderedDict()
+        self._finalized_progress_ids: OrderedDict[str, bool] = OrderedDict()
+        self._active_turn_chats: dict[str, str] = {}
+        self._turn_progress_bubbles: dict[str, str] = {}
+        self._turn_reply_to: dict[str, str] = {}
+        self._turn_placeholder_tasks: dict[str, asyncio.Task] = {}
         self._contact_name_cache: dict[str, str] = {}
         self._contact_name_cache_ts: float = 0.0
         # The runner carries this shared cache across adapter rebuilds. Store only accepted content.
@@ -553,11 +608,63 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         await super()._queue_text_debounce(session_key, event)
         event._gateway_accepted = True
 
+    def _cancel_turn_placeholder_task(self, turn_key: str) -> None:
+        task = self._turn_placeholder_tasks.pop(turn_key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
     async def _process_message_background(self, event, session_key):
         # Core debounce/queue merges update event.message_id, not source.message_id.
         # Bind the final admitted event anchor before the runner snapshots its context.
         event.source.message_id = event.message_id
-        return await super()._process_message_background(event, session_key)
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        turn_key = _turn_chat_key(chat_id)
+        if turn_key:
+            self._cancel_turn_placeholder_task(turn_key)
+            self._active_turn_chats[turn_key] = session_key
+            if event.message_id:
+                self._turn_reply_to[turn_key] = event.message_id
+            if (
+                self.working_placeholder_enabled
+                and self.working_placeholder_delay > 0
+                and self._private_api_enabled
+                and self._helper_connected
+                and self.client is not None
+                and not getattr(event, "internal", False)
+            ):
+                async def _emit_working_placeholder() -> None:
+                    try:
+                        await asyncio.sleep(self.working_placeholder_delay)
+                        if (
+                            self._active_turn_chats.get(turn_key) == session_key
+                            and turn_key not in self._turn_progress_bubbles
+                            and self._private_api_enabled
+                            and self._helper_connected
+                            and self.client is not None
+                        ):
+                            await self.send(
+                                chat_id,
+                                self.working_placeholder_text,
+                                reply_to=event.message_id,
+                                metadata={"_interim_send": True, "_working_placeholder": True},
+                            )
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as exc:
+                        logger.debug("[bluebubbles] Working placeholder error: %s", exc)
+
+                self._turn_placeholder_tasks[turn_key] = asyncio.create_task(_emit_working_placeholder())
+        try:
+            return await super()._process_message_background(event, session_key)
+        finally:
+            if turn_key and self._active_turn_chats.get(turn_key) == session_key:
+                self._cancel_turn_placeholder_task(turn_key)
+                self._active_turn_chats.pop(turn_key, None)
+                self._turn_reply_to.pop(turn_key, None)
+                leftover_id = self._turn_progress_bubbles.pop(turn_key, None)
+                if leftover_id and self.client and self._private_api_enabled and self._helper_connected:
+                    with suppress(Exception):
+                        await self.unsend_message(chat_id, leftover_id)
 
     # --- API helpers ---
 
@@ -609,6 +716,10 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
     def _remember_sent_message(self, chat_id: str, guid: str, message_id: Optional[str]) -> None:
         if not message_id or message_id == "ok":
             return
+        self._message_sent_at.setdefault(message_id, time.monotonic())
+        self._message_sent_at.move_to_end(message_id)
+        self._message_edit_counts.setdefault(message_id, 0)
+        self._message_edit_counts.move_to_end(message_id)
         for key in (chat_id, guid, _canonical_chat_guid_key(guid), _canonical_chat_guid_key(chat_id)):
             if not key:
                 continue
@@ -621,6 +732,30 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             self._last_sent_by_chat.popitem(last=False)
         while len(self._sent_messages) > 2000:
             self._sent_messages.popitem(last=False)
+        while len(self._message_sent_at) > 2000:
+            self._message_sent_at.popitem(last=False)
+        while len(self._message_edit_counts) > 2000:
+            self._message_edit_counts.popitem(last=False)
+
+    def _follow_replaced_message_id(self, message_id: Optional[str]) -> Optional[str]:
+        current = (message_id or "").strip() or None
+        if not current:
+            return None
+        seen: set[str] = set()
+        while current in self._replaced_message_ids and current not in seen:
+            seen.add(current)
+            current = self._replaced_message_ids[current]
+        return current
+
+    def _mark_finalized_progress_id(self, message_id: Optional[str]) -> None:
+        if not message_id:
+            return
+        for mid in (message_id, self._follow_replaced_message_id(message_id)):
+            if mid:
+                self._finalized_progress_ids[mid] = True
+                self._finalized_progress_ids.move_to_end(mid)
+        while len(self._finalized_progress_ids) > 2000:
+            self._finalized_progress_ids.popitem(last=False)
 
     def _resolve_sent_message_id(self, chat_id: str, guid: str, message_id: Optional[str] = None) -> Optional[str]:
         cleaned = (message_id or "").strip()
@@ -996,12 +1131,79 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             return SendResult(success=False, error="BlueBubbles send requires text")
         if not self._is_target_allowed(chat_id):
             return SendResult(success=False, error=f"BlueBubbles chat not allowed for this profile: {chat_id}")
-        # Each paragraph becomes its own iMessage bubble; truncate any still too long.
-        paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()] or [text]
-        chunks = [c for para in paragraphs for c in (
-            [para] if len(para) <= self.MAX_MESSAGE_LENGTH else self.truncate_message(para, self.MAX_MESSAGE_LENGTH))]
+
+        turn_key = _turn_chat_key(chat_id)
+        in_active_turn = bool(
+            turn_key
+            and turn_key in self._active_turn_chats
+            and self._private_api_enabled
+            and self._helper_connected
+        )
+        is_final_send = bool(meta.get("notify"))
+        if in_active_turn and not meta.get("_working_placeholder"):
+            self._cancel_turn_placeholder_task(turn_key)
+
+        if in_active_turn and not is_final_send:
+            single_chunk = (
+                text
+                if len(text) <= self.MAX_MESSAGE_LENGTH
+                else self.truncate_message(text, self.MAX_MESSAGE_LENGTH)[-1]
+            )
+            existing_prog_id = self._turn_progress_bubbles.get(turn_key)
+            if existing_prog_id:
+                return await self.edit_message(
+                    chat_id, existing_prog_id, single_chunk, finalize=False, metadata=meta
+                )
+            reply_anchor = reply_to or self._turn_reply_to.get(turn_key)
+            guid = await self._resolve_chat_guid(chat_id)
+            if not guid or not self._is_chat_allowed(
+                guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)
+            ):
+                return SendResult(success=False, error=f"BlueBubbles chat not found for target: {chat_id}")
+            payload: dict[str, Any] = {"chatGuid": guid, "tempGuid": _temp_guid(), "message": single_chunk}
+            if reply_anchor:
+                payload.update(method="private-api", selectedMessageGuid=reply_anchor, partIndex=0)
+            res = await self._post_message("/api/v1/message/text", payload)
+            if res.success and res.message_id and res.message_id != "ok":
+                self._remember_sent_message(chat_id, guid, res.message_id)
+                self._turn_progress_bubbles[turn_key] = res.message_id
+            return res
+
+        morphed_first_chunk = False
         last = SendResult(success=True)
+        prog_id = self._turn_progress_bubbles.pop(turn_key, None) if (in_active_turn and is_final_send) else None
+        if prog_id:
+            if not subject and not effect_id:
+                chunks = (
+                    [text]
+                    if len(text) <= self.MAX_MESSAGE_LENGTH
+                    else self.truncate_message(text, self.MAX_MESSAGE_LENGTH)
+                )
+                first_res = await self.edit_message(
+                    chat_id, prog_id, chunks[0], finalize=True, metadata=meta
+                )
+                if first_res.success:
+                    self._mark_finalized_progress_id(prog_id)
+                    if len(chunks) == 1:
+                        return first_res
+                    morphed_first_chunk = True
+                    last = first_res
+                else:
+                    with suppress(Exception):
+                        await self.unsend_message(chat_id, prog_id)
+            else:
+                with suppress(Exception):
+                    await self.unsend_message(chat_id, prog_id)
+
+        if not morphed_first_chunk:
+            # Each paragraph becomes its own iMessage bubble; truncate any still too long.
+            paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()] or [text]
+            chunks = [c for para in paragraphs for c in (
+                [para] if len(para) <= self.MAX_MESSAGE_LENGTH else self.truncate_message(para, self.MAX_MESSAGE_LENGTH))]
+
         for idx, chunk in enumerate(chunks):
+            if morphed_first_chunk and idx == 0:
+                continue
             guid = await self._resolve_chat_guid(chat_id)
             if not guid:
                 if (self._private_api_enabled and not self.ignore_direct_messages
@@ -1014,7 +1216,7 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                 return SendResult(success=False, error=f"BlueBubbles chat not found for target: {chat_id}")
             if not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
                 return SendResult(success=False, error=f"BlueBubbles chat not allowed for this profile: {guid}")
-            payload: dict[str, Any] = {"chatGuid": guid, "tempGuid": _temp_guid(), "message": chunk}
+            payload = {"chatGuid": guid, "tempGuid": _temp_guid(), "message": chunk}
             if self._private_api_enabled and self._helper_connected:
                 if reply_to and idx == 0:
                     payload.update(method="private-api", selectedMessageGuid=reply_to, partIndex=0)
@@ -1433,11 +1635,14 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             return {"success": False, "error": str(exc) or type(exc).__name__}
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *,
-                           finalize: bool = False, part_index: int = 0) -> SendResult:
-        """Edit a previously sent iMessage via the BlueBubbles Private API."""
+                           finalize: bool = False, part_index: int = 0,
+                           metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        """Edit a previously sent iMessage via the BlueBubbles Private API, rolling over on Apple's 5-edit cap."""
         text = self.format_message(content)
         if not text:
             return SendResult(success=False, error="Edited message text cannot be empty")
+        if len(text) > self.MAX_MESSAGE_LENGTH:
+            text = self.truncate_message(text, self.MAX_MESSAGE_LENGTH)[-1]
         if not self.client or not self._private_api_enabled or not self._helper_connected:
             return SendResult(success=False, error="BlueBubbles Private API helper is unavailable")
         if not self._is_target_allowed(chat_id):
@@ -1448,17 +1653,61 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         target_id = self._resolve_sent_message_id(chat_id, guid, message_id)
         if not target_id:
             return SendResult(success=False, error="No sent message GUID available to edit in this chat")
-        res = await self._post_message(
-            f"/api/v1/message/{quote(target_id, safe='')}/edit",
-            {
-                "editedMessage": text,
-                "backwardsCompatibilityMessage": f'Edited to "{text}"',
-                "partIndex": max(0, int(part_index)),
-            },
+        live_id = self._follow_replaced_message_id(target_id) or target_id
+
+        turn_key = _turn_chat_key(chat_id) or _turn_chat_key(guid)
+        if turn_key and turn_key in self._active_turn_chats:
+            self._cancel_turn_placeholder_task(turn_key)
+        active_prog_id = self._turn_progress_bubbles.get(turn_key) if turn_key else None
+        is_progress_bubble = bool(
+            active_prog_id and (active_prog_id == target_id or self._follow_replaced_message_id(active_prog_id) == live_id)
         )
-        if res.success and (not res.message_id or res.message_id == "ok"):
-            res.message_id = target_id
-        return res
+        # Reserve the 5th edit for finalize=True on active turn progress bubbles so the final answer can edit in place.
+        max_edits = _IMESSAGE_MAX_EDITS if (finalize or not is_progress_bubble) else (_IMESSAGE_MAX_EDITS - 1)
+        edits = self._message_edit_counts.get(live_id, 0)
+        sent_at = self._message_sent_at.get(live_id)
+        expired = sent_at is not None and (time.monotonic() - sent_at) >= _IMESSAGE_EDIT_WINDOW_SECONDS
+
+        if edits < max_edits and not expired:
+            res = await self._post_message(
+                f"/api/v1/message/{quote(live_id, safe='')}/edit",
+                {
+                    "editedMessage": text,
+                    "backwardsCompatibilityMessage": f'Edited to "{text}"',
+                    "partIndex": max(0, int(part_index)),
+                },
+            )
+            if res.success:
+                self._message_edit_counts[live_id] = edits + 1
+                self._message_edit_counts.move_to_end(live_id)
+                res.message_id = target_id
+                return res
+            if not is_progress_bubble and edits == 0:
+                return res
+
+        # Apple's 5-edit cap or 15-minute window reached (or progress edit rejected):
+        # unsend the exhausted bubble and send a fresh replacement bubble seamlessly.
+        with suppress(Exception):
+            await self._post_message(
+                f"/api/v1/message/{quote(live_id, safe='')}/unsend",
+                {"partIndex": max(0, int(part_index))},
+            )
+        payload: dict[str, Any] = {"chatGuid": guid, "tempGuid": _temp_guid(), "message": text}
+        reply_anchor = self._turn_reply_to.get(turn_key) if (turn_key and is_progress_bubble) else None
+        if reply_anchor:
+            payload.update(method="private-api", selectedMessageGuid=reply_anchor, partIndex=0)
+        new_res = await self._post_message("/api/v1/message/text", payload)
+        if new_res.success and new_res.message_id and new_res.message_id != "ok":
+            new_id = new_res.message_id
+            self._remember_sent_message(chat_id, guid, new_id)
+            self._replaced_message_ids[target_id] = new_id
+            self._replaced_message_ids.move_to_end(target_id)
+            self._replaced_message_ids[live_id] = new_id
+            self._replaced_message_ids.move_to_end(live_id)
+            while len(self._replaced_message_ids) > 2000:
+                self._replaced_message_ids.popitem(last=False)
+            new_res.message_id = target_id
+        return new_res
 
     async def unsend_message(self, chat_id: str, message_id: Optional[str] = None, *,
                              part_index: int = 0) -> SendResult:
@@ -1473,22 +1722,28 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         target_id = self._resolve_sent_message_id(chat_id, guid, message_id)
         if not target_id:
             return SendResult(success=False, error="No sent message GUID available to unsend in this chat")
+        live_id = self._follow_replaced_message_id(target_id) or target_id
         res = await self._post_message(
-            f"/api/v1/message/{quote(target_id, safe='')}/unsend",
+            f"/api/v1/message/{quote(live_id, safe='')}/unsend",
             {"partIndex": max(0, int(part_index))},
         )
         if res.success:
             for key in (chat_id, guid, _canonical_chat_guid_key(guid), _canonical_chat_guid_key(chat_id)):
-                if key and self._last_sent_by_chat.get(key) == target_id:
+                if key and self._last_sent_by_chat.get(key) in (target_id, live_id):
                     self._last_sent_by_chat.pop(key, None)
                 if key:
                     self._sent_messages.pop((key, target_id), None)
+                    self._sent_messages.pop((key, live_id), None)
             if not res.message_id or res.message_id == "ok":
                 res.message_id = target_id
         return res
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Gateway delete_message interface mapped to BlueBubbles Private API unsend."""
+        if message_id in self._finalized_progress_ids or (
+            self._follow_replaced_message_id(message_id) in self._finalized_progress_ids
+        ):
+            return True
         return (await self.unsend_message(chat_id, message_id)).success
 
     async def notify_anyway(self, chat_id: str, message_id: Optional[str] = None) -> dict[str, Any]:
@@ -2078,7 +2333,14 @@ def register(ctx) -> None:
         # truncates itself (MAX_MESSAGE_LENGTH), exactly as the former core sender did.
         max_message_length=0, pii_safe=True, emoji="💬", allow_update_command=True,
         platform_hint=_PLATFORM_HINT,
-        display_tier="low",
+        display_tier="medium",
+        display_overrides={
+            "streaming": False,
+            "tool_progress": "new",
+            "tool_progress_grouping": "accumulate",
+            "long_running_notifications": True,
+            "interim_assistant_messages": True,
+        },
         env_overrides=gateway_env.ENV_OVERRIDES,
         env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS, **gateway_env.AUTHZ,
     )

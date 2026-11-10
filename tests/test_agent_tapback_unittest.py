@@ -469,3 +469,132 @@ class ToolRuntimeTest(unittest.TestCase):
             self.assertEqual(res_filtered["data"][0]["display_name"], "Dominik Airey")
             self.assertIn("Reading, MA", res_filtered["data"][0]["short_address"])
 
+    def test_turn_working_placeholder_progress_rollover_and_final_morph(self):
+        from gateway.platforms.event import MessageEvent, MessageType
+        from plugin.adapter import _turn_chat_key
+
+        adapter = BlueBubblesAdapter(
+            PlatformConfig(
+                extra={
+                    "server_url": "http://localhost:1234",
+                    "password": "fake",
+                    "working_placeholder": True,
+                    "working_placeholder_delay": 0.02,
+                    "working_placeholder_text": "⏳ Working on it...",
+                }
+            )
+        )
+        adapter.client = AsyncMock()
+        adapter._private_api_enabled = True
+        adapter._helper_connected = True
+        adapter._guid_cache["+15551234567"] = "iMessage;-;+15551234567"
+        adapter._guid_cache["iMessage;-;+15551234567"] = "iMessage;-;+15551234567"
+
+        api_calls: list[tuple[str, dict]] = []
+        sent_counter = [0]
+
+        async def fake_post_message(path: str, payload: dict):
+            api_calls.append((path, dict(payload)))
+            if path == "/api/v1/message/text":
+                sent_counter[0] += 1
+                return SendResult(success=True, message_id=f"bubble-{sent_counter[0]}")
+            return SendResult(success=True, message_id="ok")
+
+        adapter._post_message = AsyncMock(side_effect=fake_post_message)
+
+        async def scenario():
+            source = adapter.build_source(chat_id="+15551234567", chat_type="dm", user_id="+15551234567")
+            event = MessageEvent(
+                text="run long task",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id="user-msg-99",
+            )
+            turn_key = _turn_chat_key("+15551234567")
+
+            async def fake_super_process(_self, ev, sk):
+                # Wait for working placeholder to fire automatically
+                await asyncio.sleep(0.05)
+                self.assertEqual(adapter._turn_progress_bubbles.get(turn_key), "bubble-1")
+                self.assertEqual(len(api_calls), 1)
+                self.assertEqual(api_calls[0][0], "/api/v1/message/text")
+                self.assertEqual(api_calls[0][1]["message"], "⏳ Working on it...")
+                self.assertEqual(api_calls[0][1]["selectedMessageGuid"], "user-msg-99")
+
+                # 4 mid-turn progress updates should edit bubble-1 in place (edits 1..4)
+                for step in range(1, 5):
+                    r = await adapter.send(
+                        "+15551234567",
+                        f"🔧 Step {step} running...",
+                        metadata={"_interim_send": True},
+                    )
+                    self.assertTrue(r.success)
+                    self.assertEqual(r.message_id, "bubble-1")
+                    self.assertEqual(api_calls[-1][0], "/api/v1/message/bubble-1/edit")
+                    self.assertEqual(api_calls[-1][1]["editedMessage"], f"🔧 Step {step} running...")
+
+                # 5th mid-turn progress update triggers rollover (unsend bubble-1 + send bubble-2)
+                # because the 5th edit on bubble-1 was reserved for finalize=True!
+                r5 = await adapter.send(
+                    "+15551234567",
+                    "🔧 Step 5 running...",
+                    metadata={"_interim_send": True},
+                )
+                self.assertTrue(r5.success)
+                self.assertEqual(r5.message_id, "bubble-1")
+                self.assertEqual(api_calls[-2][0], "/api/v1/message/bubble-1/unsend")
+                self.assertEqual(api_calls[-1][0], "/api/v1/message/text")
+                self.assertEqual(api_calls[-1][1]["message"], "🔧 Step 5 running...")
+                self.assertEqual(adapter._follow_replaced_message_id("bubble-1"), "bubble-2")
+
+                # Subsequent edit via edit_message("bubble-1") edits bubble-2 in place!
+                r6 = await adapter.edit_message(
+                    "+15551234567",
+                    "bubble-1",
+                    "🔧 Step 6 almost done...",
+                    metadata={"_interim_send": True},
+                )
+                self.assertTrue(r6.success)
+                self.assertEqual(r6.message_id, "bubble-1")
+                self.assertEqual(api_calls[-1][0], "/api/v1/message/bubble-2/edit")
+
+                # Final answer send (notify=True) morphs bubble-2 in place into the final response!
+                final_res = await adapter.send(
+                    "+15551234567",
+                    "Here is the final answer!\n\nSecond paragraph stays in the same bubble.",
+                    metadata={"notify": True},
+                )
+                self.assertTrue(final_res.success)
+                self.assertEqual(api_calls[-1][0], "/api/v1/message/bubble-2/edit")
+                self.assertIn("Second paragraph stays in the same bubble.", api_calls[-1][1]["editedMessage"])
+
+                # Post-delivery delete_message on a finalized progress bubble is a no-op
+                self.assertTrue(await adapter.delete_message("+15551234567", "bubble-1"))
+                self.assertNotEqual(api_calls[-1][0], "/api/v1/message/bubble-2/unsend")
+
+            with patch.object(
+                BlueBubblesAdapter.__mro__[2],
+                "_process_message_background",
+                new=fake_super_process,
+            ):
+                await adapter._process_message_background(event, "sess-1")
+
+            # Also verify that if a turn finishes without a final text send, the leftover working bubble is unsent
+            api_calls.clear()
+
+            async def fake_aborted_process(_self, ev, sk):
+                await asyncio.sleep(0.05)
+                self.assertIn(turn_key, adapter._turn_progress_bubbles)
+
+            with patch.object(
+                BlueBubblesAdapter.__mro__[2],
+                "_process_message_background",
+                new=fake_aborted_process,
+            ):
+                await adapter._process_message_background(event, "sess-2")
+
+            self.assertEqual(api_calls[-1][0], "/api/v1/message/bubble-3/unsend")
+
+        asyncio.run(scenario())
+
+
