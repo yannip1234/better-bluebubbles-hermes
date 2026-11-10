@@ -478,6 +478,7 @@ class ToolRuntimeTest(unittest.TestCase):
                 extra={
                     "server_url": "http://localhost:1234",
                     "password": "fake",
+                    "status_tapbacks": False,
                     "working_placeholder": True,
                     "working_placeholder_delay": 0.02,
                     "working_placeholder_text": "⏳ Working on it...",
@@ -596,5 +597,140 @@ class ToolRuntimeTest(unittest.TestCase):
             self.assertEqual(api_calls[-1][0], "/api/v1/message/bubble-3/unsend")
 
         asyncio.run(scenario())
+
+    def test_status_tapbacks_seen_thinking_and_creative_agent_override(self):
+        from gateway.platforms.event import MessageEvent, MessageType
+
+        adapter = BlueBubblesAdapter(
+            PlatformConfig(
+                extra={
+                    "server_url": "http://localhost:1234",
+                    "password": "fake",
+                    "thinking_tapback_delay": 0.02,
+                }
+            )
+        )
+        adapter.client = AsyncMock()
+        adapter._private_api_enabled = True
+        adapter._helper_connected = True
+        adapter._guid_cache["+15551234567"] = "iMessage;-;+15551234567"
+        adapter._guid_cache["iMessage;-;+15551234567"] = "iMessage;-;+15551234567"
+
+        api_calls: list[tuple[str, dict]] = []
+        sent_counter = [0]
+
+        async def fake_post_message(path: str, payload: dict):
+            api_calls.append((path, dict(payload)))
+            if path == "/api/v1/message/text":
+                sent_counter[0] += 1
+                return SendResult(success=True, message_id=f"bubble-{sent_counter[0]}")
+            return SendResult(success=True, message_id="ok")
+
+        adapter._post_message = AsyncMock(side_effect=fake_post_message)
+
+        async def scenario():
+            source = adapter.build_source(chat_id="+15551234567", chat_type="dm", user_id="+15551234567")
+            event = MessageEvent(
+                text="check piazza for office hours",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id="user-msg-101",
+            )
+
+            async def fake_super_process_1(_self, ev, sk):
+                # Yield once so immediate 👀 tapback task runs
+                await asyncio.sleep(0.005)
+                self.assertEqual(len(api_calls), 1)
+                self.assertEqual(api_calls[0][0], "/api/v1/message/react")
+                self.assertEqual(api_calls[0][1]["reaction"], "👀")
+                self.assertEqual(api_calls[0][1]["selectedMessageGuid"], "user-msg-101")
+
+                # Wait for thinking delay -> transitions to 🧠
+                await asyncio.sleep(0.03)
+                self.assertEqual(len(api_calls), 2)
+                self.assertEqual(api_calls[1][0], "/api/v1/message/react")
+                self.assertEqual(api_calls[1][1]["reaction"], "🧠")
+
+                # Thinking/progress output creates bubble-1 and edits it in place
+                r1 = await adapter.send(
+                    "+15551234567",
+                    "💭 Checking Piazza for COMS W4731 office hours...",
+                    metadata={"_interim_send": True},
+                )
+                self.assertTrue(r1.success)
+                self.assertEqual(api_calls[-1][0], "/api/v1/message/text")
+                self.assertEqual(api_calls[-1][1]["message"], "💭 Checking Piazza for COMS W4731 office hours...")
+
+                r2 = await adapter.edit_message(
+                    "+15551234567",
+                    "bubble-1",
+                    "💭 Checking Piazza for COMS W4731 office hours...\n🌐 Searching Piazza...",
+                    metadata={"_interim_send": True},
+                )
+                self.assertTrue(r2.success)
+                self.assertEqual(api_calls[-1][0], "/api/v1/message/bubble-1/edit")
+
+                # Final reply removes 🧠 tapback (-🧠) and edits bubble-1 in place!
+                final_res = await adapter.send(
+                    "+15551234567",
+                    "Progga's office hours are Tue 1:45-3:45pm and Thu 1-3pm.",
+                    metadata={"notify": True},
+                )
+                self.assertTrue(final_res.success)
+                self.assertEqual(api_calls[-2][0], "/api/v1/message/react")
+                self.assertEqual(api_calls[-2][1]["reaction"], "-🧠")
+                self.assertEqual(api_calls[-1][0], "/api/v1/message/bubble-1/edit")
+                self.assertEqual(
+                    api_calls[-1][1]["editedMessage"],
+                    "Progga's office hours are Tue 1:45-3:45pm and Thu 1-3pm.",
+                )
+
+            with patch.object(
+                BlueBubblesAdapter.__mro__[2],
+                "_process_message_background",
+                new=fake_super_process_1,
+            ):
+                await adapter._process_message_background(event, "sess-tapback-1")
+
+            # Turn 2: Hermes chooses a creative emoji via bluebubbles_tapback (e.g. 🦖).
+            # Verify it overrides 🧠 and is NOT removed when the turn finishes!
+            api_calls.clear()
+            event2 = MessageEvent(
+                text="rawr",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id="user-msg-102",
+            )
+
+            async def fake_super_process_2(_self, ev, sk):
+                await asyncio.sleep(0.03)
+                # Agent explicitly calls add_reaction (via bluebubbles_tapback) with 🦖
+                res = await adapter.add_reaction("+15551234567", "🦖", "user-msg-102")
+                self.assertTrue(res["success"])
+                # Tool progress line for bluebubbles_tapback should be stripped and not create a bubble
+                prog_res = await adapter.send(
+                    "+15551234567",
+                    '⚙️ bluebubbles_tapback {"reaction": "🦖"}',
+                    metadata={"_interim_send": True},
+                )
+                self.assertTrue(prog_res.success)
+                await adapter.send(
+                    "+15551234567",
+                    "Dino mode activated!",
+                    metadata={"notify": True},
+                )
+
+            with patch.object(
+                BlueBubblesAdapter.__mro__[2],
+                "_process_message_background",
+                new=fake_super_process_2,
+            ):
+                await adapter._process_message_background(event2, "sess-tapback-2")
+
+            reactions_sent = [p["reaction"] for path, p in api_calls if path == "/api/v1/message/react"]
+            self.assertEqual(reactions_sent, ["👀", "🧠", "🦖"])
+
+        asyncio.run(scenario())
+
 
 

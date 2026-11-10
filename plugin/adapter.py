@@ -72,6 +72,7 @@ _IMESSAGE_MAX_EDITS = 5
 _IMESSAGE_EDIT_WINDOW_SECONDS = 840.0  # 14m safety margin under Apple's 15m edit window
 DEFAULT_WORKING_PLACEHOLDER_TEXT = "⏳ Working on it..."
 DEFAULT_WORKING_PLACEHOLDER_DELAY = 2.0
+DEFAULT_THINKING_TAPBACK_DELAY = 1.0
 
 
 def _turn_chat_key(value: Optional[str]) -> str:
@@ -82,6 +83,16 @@ def _turn_chat_key(value: Optional[str]) -> str:
     if delimiter == _GROUP_DELIMITER:
         return f"{_GROUP_DELIMITER}{identifier.lower()}"
     return f"{_DM_DELIMITER}{identifier.lower()}"
+
+
+def _strip_tapback_progress_lines(text: str) -> str:
+    """Filter out internal tapback tool-progress lines so creative tapbacks don't echo as text."""
+    kept = [
+        line
+        for line in (text or "").splitlines()
+        if "bluebubbles_tapback" not in line and "bluebubbles_remove_tapback" not in line
+    ]
+    return "\n".join(kept).strip()
 
 # iMessage has no stable bot mention identity (unlike <@U...>/@botname/MXID), so
 # `require_mention: true` without custom aliases uses Hermes wake words.
@@ -549,8 +560,30 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         )
         parsed_working_placeholder = _parse_optional_bool(raw_working_placeholder)
         self.working_placeholder_enabled: bool = (
-            True if parsed_working_placeholder is None else parsed_working_placeholder
+            False if parsed_working_placeholder is None else parsed_working_placeholder
         )
+        raw_status_tapbacks = (
+            extra.get("status_tapbacks")
+            if "status_tapbacks" in extra
+            else _get_scoped_secret("BLUEBUBBLES_STATUS_TAPBACKS")
+        )
+        parsed_status_tapbacks = _parse_optional_bool(raw_status_tapbacks)
+        self.status_tapbacks_enabled: bool = (
+            True if parsed_status_tapbacks is None else parsed_status_tapbacks
+        )
+        raw_thinking_delay = (
+            extra.get("thinking_tapback_delay")
+            if "thinking_tapback_delay" in extra
+            else _get_scoped_secret("BLUEBUBBLES_THINKING_TAPBACK_DELAY")
+        )
+        try:
+            self.thinking_tapback_delay: float = (
+                float(raw_thinking_delay)
+                if raw_thinking_delay is not None and str(raw_thinking_delay).strip() != ""
+                else DEFAULT_THINKING_TAPBACK_DELAY
+            )
+        except (TypeError, ValueError):
+            self.thinking_tapback_delay = DEFAULT_THINKING_TAPBACK_DELAY
         raw_placeholder_delay = (
             extra.get("working_placeholder_delay")
             if "working_placeholder_delay" in extra
@@ -594,6 +627,9 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         self._turn_progress_bubbles: dict[str, str] = {}
         self._turn_reply_to: dict[str, str] = {}
         self._turn_placeholder_tasks: dict[str, asyncio.Task] = {}
+        self._turn_thinking_tapback_tasks: dict[str, asyncio.Task] = {}
+        self._turn_status_tapbacks: dict[str, tuple[str, str]] = {}
+        self._turn_agent_tapback_override: set[str] = set()
         self._contact_name_cache: dict[str, str] = {}
         self._contact_name_cache_ts: float = 0.0
         # The runner carries this shared cache across adapter rebuilds. Store only accepted content.
@@ -613,6 +649,46 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         if task is not None and not task.done():
             task.cancel()
 
+    def _cancel_turn_thinking_tapback_task(self, turn_key: str) -> None:
+        task = self._turn_thinking_tapback_tasks.pop(turn_key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _set_turn_status_tapback(
+        self, turn_key: str, chat_id: Optional[str], message_id: Optional[str], emoji: str
+    ) -> None:
+        if (
+            not self.status_tapbacks_enabled
+            or not turn_key
+            or not chat_id
+            or not message_id
+            or turn_key not in self._active_turn_chats
+            or turn_key in self._turn_agent_tapback_override
+            or not self.client
+            or not self._private_api_enabled
+            or not self._helper_connected
+        ):
+            return
+        if self._turn_status_tapbacks.get(turn_key) == (message_id, emoji):
+            return
+        self._turn_status_tapbacks[turn_key] = (message_id, emoji)
+        with suppress(Exception):
+            await self.add_reaction(chat_id, emoji, message_id, _auto_status=True)
+
+    async def _clear_turn_status_tapback(self, turn_key: str, chat_id: Optional[str]) -> None:
+        self._cancel_turn_thinking_tapback_task(turn_key)
+        status_tb = self._turn_status_tapbacks.pop(turn_key, None)
+        if (
+            status_tb
+            and turn_key not in self._turn_agent_tapback_override
+            and chat_id
+            and self.client
+            and self._private_api_enabled
+            and self._helper_connected
+        ):
+            with suppress(Exception):
+                await self.remove_reaction(chat_id, status_tb[0])
+
     async def _process_message_background(self, event, session_key):
         # Core debounce/queue merges update event.message_id, not source.message_id.
         # Bind the final admitted event anchor before the runner snapshots its context.
@@ -621,9 +697,42 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         turn_key = _turn_chat_key(chat_id)
         if turn_key:
             self._cancel_turn_placeholder_task(turn_key)
+            self._cancel_turn_thinking_tapback_task(turn_key)
+            self._turn_agent_tapback_override.discard(turn_key)
+            self._turn_status_tapbacks.pop(turn_key, None)
             self._active_turn_chats[turn_key] = session_key
             if event.message_id:
                 self._turn_reply_to[turn_key] = event.message_id
+            if (
+                self.status_tapbacks_enabled
+                and event.message_id
+                and self._private_api_enabled
+                and self._helper_connected
+                and self.client is not None
+                and not getattr(event, "internal", False)
+            ):
+                asyncio.create_task(
+                    self._set_turn_status_tapback(turn_key, chat_id, event.message_id, "👀")
+                )
+                if self.thinking_tapback_delay >= 0:
+                    async def _emit_thinking_tapback() -> None:
+                        try:
+                            await asyncio.sleep(self.thinking_tapback_delay)
+                            if (
+                                self._active_turn_chats.get(turn_key) == session_key
+                                and turn_key not in self._turn_agent_tapback_override
+                            ):
+                                await self._set_turn_status_tapback(
+                                    turn_key, chat_id, event.message_id, "🧠"
+                                )
+                        except asyncio.CancelledError:
+                            return
+                        except Exception as exc:
+                            logger.debug("[bluebubbles] Thinking tapback error: %s", exc)
+
+                    self._turn_thinking_tapback_tasks[turn_key] = asyncio.create_task(
+                        _emit_thinking_tapback()
+                    )
             if (
                 self.working_placeholder_enabled
                 and self.working_placeholder_delay > 0
@@ -659,6 +768,8 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         finally:
             if turn_key and self._active_turn_chats.get(turn_key) == session_key:
                 self._cancel_turn_placeholder_task(turn_key)
+                await self._clear_turn_status_tapback(turn_key, chat_id)
+                self._turn_agent_tapback_override.discard(turn_key)
                 self._active_turn_chats.pop(turn_key, None)
                 self._turn_reply_to.pop(turn_key, None)
                 leftover_id = self._turn_progress_bubbles.pop(turn_key, None)
@@ -1144,6 +1255,26 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             self._cancel_turn_placeholder_task(turn_key)
 
         if in_active_turn and not is_final_send:
+            cleaned_text = _strip_tapback_progress_lines(text)
+            if not cleaned_text:
+                return SendResult(
+                    success=True,
+                    message_id=self._turn_progress_bubbles.get(turn_key) or "ok",
+                )
+            text = cleaned_text
+            if (
+                self.status_tapbacks_enabled
+                and turn_key not in self._turn_agent_tapback_override
+                and self._turn_reply_to.get(turn_key)
+                and (
+                    self._turn_status_tapbacks.get(turn_key) is None
+                    or self._turn_status_tapbacks.get(turn_key)[1] != "🧠"
+                )
+            ):
+                self._cancel_turn_thinking_tapback_task(turn_key)
+                await self._set_turn_status_tapback(
+                    turn_key, chat_id, self._turn_reply_to.get(turn_key), "🧠"
+                )
             single_chunk = (
                 text
                 if len(text) <= self.MAX_MESSAGE_LENGTH
@@ -1168,6 +1299,9 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                 self._remember_sent_message(chat_id, guid, res.message_id)
                 self._turn_progress_bubbles[turn_key] = res.message_id
             return res
+
+        if in_active_turn and is_final_send:
+            await self._clear_turn_status_tapback(turn_key, chat_id)
 
         morphed_first_chunk = False
         used_single_bubble_chunks = False
@@ -1664,6 +1798,11 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         is_progress_bubble = bool(
             active_prog_id and (active_prog_id == target_id or self._follow_replaced_message_id(active_prog_id) == live_id)
         )
+        if is_progress_bubble and not finalize:
+            cleaned_text = _strip_tapback_progress_lines(text)
+            if not cleaned_text:
+                return SendResult(success=True, message_id=target_id)
+            text = cleaned_text
         # Reserve the 5th edit for finalize=True on active turn progress bubbles so the final answer can edit in place.
         max_edits = _IMESSAGE_MAX_EDITS if (finalize or not is_progress_bubble) else (_IMESSAGE_MAX_EDITS - 1)
         edits = self._message_edit_counts.get(live_id, 0)
@@ -1763,7 +1902,14 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             return {"success": False, "error": res.error}
         return {"success": True, "message_id": res.message_id if res.message_id != "ok" else target_id}
 
-    async def add_reaction(self, chat_id: str, emoji: str, message_id: Optional[str] = None) -> dict[str, Any]:
+    async def add_reaction(
+        self,
+        chat_id: str,
+        emoji: str,
+        message_id: Optional[str] = None,
+        *,
+        _auto_status: bool = False,
+    ) -> dict[str, Any]:
         """Send one of the six classic tapbacks or an arbitrary emoji tapback via the gateway reaction interface."""
         reaction = normalize_tapback_reaction(emoji)
         if not reaction:
@@ -1777,6 +1923,12 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         guid = await self._resolve_chat_guid(chat_id)
         if not guid or not self._is_chat_allowed(guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)):
             return {"success": False, "error": "Chat not found"}
+        if not _auto_status:
+            turn_key = _turn_chat_key(chat_id) or _turn_chat_key(guid)
+            if turn_key:
+                self._turn_agent_tapback_override.add(turn_key)
+                self._cancel_turn_thinking_tapback_task(turn_key)
+                self._turn_status_tapbacks.pop(turn_key, None)
         result = await self._post_message("/api/v1/message/react", {
             "chatGuid": guid, "selectedMessageGuid": message_id, "reaction": reaction, "partIndex": 0})
         if not result.success:
@@ -2293,7 +2445,10 @@ _PLATFORM_HINT = (
     "sentence rather than nested bullets. Put a command or code snippet on its own line as plain text so it "
     "can be copied. Write links as bare URLs (iMessage auto-links them). "
     "You can send files natively: write MEDIA:/absolute/path/to/file in your response. "
-    "Images (.jpg, .png, .heic) appear as photos and other files arrive as attachments."
+    "Images (.jpg, .png, .heic) appear as photos and other files arrive as attachments. "
+    "You can react to messages with bluebubbles_tapback using ANY single emoji (not just the classic 6)—be "
+    "creative and expressive with your emoji choice when a reaction fits the vibe, humor, or topic of their "
+    "message (e.g. 🫡, 🔥, 🎉, 💡, 🦖, 🤝, ✨, 💀, 🚀, 🎯, 🫶, 🧑‍🍳, 🕵️)."
 )
 
 
@@ -2336,6 +2491,7 @@ def register(ctx) -> None:
         display_tier="medium",
         display_overrides={
             "streaming": False,
+            "thinking_progress": True,
             "tool_progress": "new",
             "tool_progress_grouping": "accumulate",
             "long_running_notifications": True,
