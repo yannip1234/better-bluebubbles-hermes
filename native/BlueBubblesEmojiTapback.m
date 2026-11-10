@@ -1151,6 +1151,58 @@ static void swizzled_handleMessage(id self, SEL _cmd, id netController, NSString
 }
 
 // ---------------------------------------------------------------------------
+// macOS 26/27 (Tahoe) IMChat Edit Compatibility Shim
+// ---------------------------------------------------------------------------
+// BlueBubblesHelperOrig.dylib calls:
+//   -[IMChat editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:]
+// On macOS 26/27+, IMChat replaced that selector with:
+//   -[IMChat editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:]
+// and requires __kIMMessagePartAttributeName on the NSAttributedString.
+
+static NSAttributedString *ensureEditedPartAttributes(id attrOrStr, NSInteger partIndex) {
+    NSString *plain = nil;
+    NSDictionary *existingAttrs = nil;
+    if ([attrOrStr isKindOfClass:[NSAttributedString class]]) {
+        NSAttributedString *as = (NSAttributedString *)attrOrStr;
+        plain = as.string ?: @"";
+        if (as.length > 0) {
+            existingAttrs = [as attributesAtIndex:0 effectiveRange:NULL];
+        }
+    } else if ([attrOrStr isKindOfClass:[NSString class]]) {
+        plain = (NSString *)attrOrStr;
+    } else {
+        plain = @"";
+    }
+    NSMutableDictionary *attrs = existingAttrs
+        ? [existingAttrs mutableCopy]
+        : [NSMutableDictionary dictionary];
+    if (!attrs[@"__kIMMessagePartAttributeName"]) {
+        attrs[@"__kIMMessagePartAttributeName"] = @(partIndex >= 0 ? partIndex : 0);
+    }
+    return [[NSAttributedString alloc] initWithString:plain attributes:attrs];
+}
+
+static void compat_editMessageItem(
+    id self,
+    SEL _cmd,
+    id messageItem,
+    NSInteger partIndex,
+    id newPartText,
+    id backwardCompatText
+) {
+    SEL newSel = sel_registerName(
+        "editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:"
+    );
+    if ([self respondsToSelector:newSel]) {
+        NSAttributedString *fixedNewText = ensureEditedPartAttributes(newPartText, partIndex);
+        NSAttributedString *fixedBcText = ensureEditedPartAttributes(backwardCompatText, partIndex);
+        ((void(*)(id, SEL, id, NSInteger, id, id, id))objc_msgSend)(
+            self, newSel, messageItem, partIndex, fixedNewText, nil, fixedBcText
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Dylib Constructor
 // ---------------------------------------------------------------------------
 
@@ -1203,10 +1255,28 @@ static void initBlueBubblesEmojiTapbackSwizzle(void) {
             }
         }
 
-        os_log(log, "BLUEBUBBLESHELPER: Emoji tapback swizzle initialized (parse=%d, verb=%d, immsg=%d, handle=%d)",
+        Class imChatCls = objc_getClass("IMChat");
+        BOOL addedEditCompat = NO;
+        if (imChatCls) {
+            SEL oldEditSel = sel_registerName(
+                "editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:"
+            );
+            SEL newEditSel = sel_registerName(
+                "editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:"
+            );
+            if (![imChatCls instancesRespondToSelector:oldEditSel] &&
+                [imChatCls instancesRespondToSelector:newEditSel]) {
+                addedEditCompat = class_addMethod(
+                    imChatCls, oldEditSel, (IMP)compat_editMessageItem, "v48@0:8@16q24@32@40"
+                );
+            }
+        }
+
+        os_log(log, "BLUEBUBBLESHELPER: Emoji tapback swizzle initialized (parse=%d, verb=%d, immsg=%d, handle=%d, editCompat=%d)",
                g_origParseReactionType != NULL,
                g_origReactionToVerb != NULL,
                g_origInitWithSender != NULL,
-               g_origHandleMessage != NULL);
+               g_origHandleMessage != NULL,
+               addedEditCompat);
     }
 }

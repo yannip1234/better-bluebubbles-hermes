@@ -1170,6 +1170,7 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             return res
 
         morphed_first_chunk = False
+        used_single_bubble_chunks = False
         last = SendResult(success=True)
         prog_id = self._turn_progress_bubbles.pop(turn_key, None) if (in_active_turn and is_final_send) else None
         if prog_id:
@@ -1179,6 +1180,7 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                     if len(text) <= self.MAX_MESSAGE_LENGTH
                     else self.truncate_message(text, self.MAX_MESSAGE_LENGTH)
                 )
+                used_single_bubble_chunks = True
                 first_res = await self.edit_message(
                     chat_id, prog_id, chunks[0], finalize=True, metadata=meta
                 )
@@ -1195,7 +1197,7 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                 with suppress(Exception):
                     await self.unsend_message(chat_id, prog_id)
 
-        if not morphed_first_chunk:
+        if not morphed_first_chunk and not used_single_bubble_chunks:
             # Each paragraph becomes its own iMessage bubble; truncate any still too long.
             paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()] or [text]
             chunks = [c for para in paragraphs for c in (
@@ -1681,11 +1683,9 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                 self._message_edit_counts[live_id] = edits + 1
                 self._message_edit_counts.move_to_end(live_id)
                 res.message_id = target_id
-                return res
-            if not is_progress_bubble and edits == 0:
-                return res
+            return res
 
-        # Apple's 5-edit cap or 15-minute window reached (or progress edit rejected):
+        # Apple's 5-edit cap or 15-minute window reached:
         # unsend the exhausted bubble and send a fresh replacement bubble seamlessly.
         with suppress(Exception):
             await self._post_message(
