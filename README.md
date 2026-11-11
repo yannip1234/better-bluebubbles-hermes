@@ -2,6 +2,17 @@
 
 BlueBubbles iMessage platform plugin (`bluebubbles-platform`) for Hermes Agent. It connects Hermes to a macOS BlueBubbles server over HTTP for outbound messages, reactions, typing indicators, and read receipts, and registers a local webhook listener for inbound `new-message` and `updated-message` events.
 
+## Repository Layout
+
+| Path | Required? | Purpose |
+| --- | --- | --- |
+| `plugin/` | **Required** | Core Hermes platform plugin (`platforms/bluebubbles`): webhook listener, multi-profile DM/group router, Markdown rich-text formatter, FindMy helper, and `bluebubbles` agent toolset. |
+| `bluebubbles-extender/` | Optional | Companion Hermes plugin that adds a **BlueBubbles** settings UI to Hermes Desktop / Web Dashboard plus `hermes bluebubbles-config` CLI commands. |
+| `native/` | Optional | Objective-C wrapper (`BlueBubblesEmojiTapback.m`) for `BlueBubblesHelper.dylib` enabling arbitrary emoji tapbacks, rich-text message edits on macOS 15+, animated text effects, Send Later, polls, and stickers. |
+| `scripts/` | Optional | Idempotent installer (`patch_bluebubbles_emoji_tapback.py`) that compiles `native/` and patches `BlueBubbles.app` in place to unlock custom emoji tapbacks and extended Private API features. |
+| `patches/` | Optional | Small Hermes gateway patch (`hermes-bf0203a-admission-receipts.patch`) preventing duplicate mid-turn steer / plain-text approval handling on follow-up `updated-message` webhooks. |
+| `tests/` | Dev only | Unit and integration test suite for inbound webhook hydration, multi-profile routing, rich-text formatting, tapbacks, and `bluebubbles-extender`. |
+
 ## Features
 
 - **Multi-profile DM and group routing.** Differentiates direct message chat GUIDs (`;-;`) from group chat GUIDs (`;+;`) so multiple Hermes profiles can share one BlueBubbles server and only accept or reply to their designated chats.
