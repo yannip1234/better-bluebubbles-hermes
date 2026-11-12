@@ -261,6 +261,10 @@ static NSString *extractChatCreatorHandle(id chat) {
             if (loginHandle && [loginHandle respondsToSelector:idSel]) {
                 NSString *handleId = ((id(*)(id, SEL))objc_msgSend)(loginHandle, idSel);
                 if ([handleId isKindOfClass:[NSString class]] && handleId.length > 0) {
+                    NSString *lower = [handleId lowercaseString];
+                    if ([lower hasPrefix:@"e:"] || [lower hasPrefix:@"p:"]) {
+                        return [handleId substringFromIndex:2];
+                    }
                     return handleId;
                 }
             }
@@ -517,15 +521,42 @@ static NSData *archivePollPayloadDict(NSDictionary *pollJson, NSUUID *sessionUUI
         return nil;
     }
     NSString *b64 = [jsonData base64EncodedStringWithOptions:0];
-    NSURL *dataUrl = [NSURL URLWithString:[NSString stringWithFormat:@"data:,%@", b64]];
+    NSArray *opts = [pollJson[@"item"] isKindOfClass:[NSDictionary class]]
+        ? ([pollJson[@"item"][@"orderedPollOptions"] isKindOfClass:[NSArray class]]
+           ? pollJson[@"item"][@"orderedPollOptions"]
+           : nil)
+        : nil;
+    NSString *urlString = (opts && opts.count > 0)
+        ? [NSString stringWithFormat:@"data:,%@?src=p&c=%lu", b64, (unsigned long)opts.count]
+        : [NSString stringWithFormat:@"data:,%@", b64];
+    NSURL *dataUrl = [NSURL URLWithString:urlString];
     if (!dataUrl) {
         return nil;
     }
-    NSDictionary *payloadDict = @{
-        @"URL": dataUrl,
-        @"sessionIdentifier": sessionUUID ?: [NSUUID UUID],
-        @"ldtext": (summaryText.length > 0) ? summaryText : @"Poll"
+    NSString *ldtext = (summaryText.length > 0) ? summaryText : @"Sent a poll";
+    NSDictionary *userInfo = @{
+        @"caption": ldtext,
+        @"subcaption": @"",
+        @"secondary-subcaption": @"",
+        @"tertiary-subcaption": @"",
+        @"image-title": @"",
+        @"image-subtitle": @"",
     };
+    NSData *liveLayoutData = [NSKeyedArchiver archivedDataWithRootObject:@{
+        @"layoutClass": @"MSMessageLiveLayout",
+        @"userInfo": @{},
+    } requiringSecureCoding:YES error:nil];
+    NSMutableDictionary *payloadDict = [NSMutableDictionary dictionaryWithDictionary:@{
+        @"URL": dataUrl,
+        @"an": @"Polls",
+        @"layoutClass": @"MSMessageTemplateLayout",
+        @"userInfo": userInfo,
+        @"ldtext": ldtext,
+        @"sessionIdentifier": sessionUUID ?: [NSUUID UUID],
+    }];
+    if (liveLayoutData) {
+        payloadDict[@"liveLayoutInfo"] = liveLayoutData;
+    }
     return [NSKeyedArchiver archivedDataWithRootObject:payloadDict requiringSecureCoding:YES error:nil];
 }
 
@@ -599,6 +630,7 @@ static void handlePollAction(
                 @"optionIdentifier": optId,
                 @"creatorHandle": creatorHandle,
                 @"text": optText,
+                @"attributedText": optText,
                 @"canBeEdited": @(canBeEdited)
             }];
         }
@@ -795,6 +827,7 @@ static void handlePollAction(
                 @"optionIdentifier": newOptId,
                 @"creatorHandle": creatorHandle,
                 @"text": newText,
+                @"attributedText": newText,
                 @"canBeEdited": @NO
             }];
             NSString *origCreator = [existingItem[@"creatorHandle"] isKindOfClass:[NSString class]]
