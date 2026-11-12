@@ -16,6 +16,7 @@ def _make_adapter(monkeypatch, **extra):
         extra={
             "server_url": "http://localhost:1234",
             "password": "secret",
+            "inbound_debounce_seconds": 0.0,
             **extra,
         },
     )
@@ -53,7 +54,7 @@ def adapter():
 
     return BlueBubblesAdapter(PlatformConfig(enabled=True, extra={
         "server_url": "http://example.invalid", "password": "synthetic-secret",
-        "send_read_receipts": False, "require_mention": False,
+        "send_read_receipts": False, "require_mention": False, "inbound_debounce_seconds": 0.0,
     }))
 
 async def settle(instance):

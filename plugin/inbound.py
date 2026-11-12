@@ -29,6 +29,8 @@ _TAPBACK_STRINGS = {
 _POLL_BUNDLE_SUBSTR = "com.apple.messages.polls"
 _DATA_URL_B64_RE = re.compile(rb"data:,([A-Za-z0-9+/=_-]+)")
 _MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
+_TYPING_EVENT = "typing-indicator"
+_INTERRUPT_BYPASS_COMMANDS = {"stop", "new", "reset"}
 _HYDRATE_RETRY_DELAYS = (0.0, 0.05, 0.15)
 _ATTACHMENT_WAIT_SECONDS = 300.0
 _ATTACHMENT_RETRY_SECONDS = 5.0
@@ -225,6 +227,33 @@ class _InboundMessage:
     force_requested: set[str] = field(default_factory=set)
     last_edit_ts: int = 0
     retracted: bool = False
+
+
+@dataclass
+class _InboundBurstEntry:
+    message_id: Optional[str]
+    text: str
+    event: MessageEvent
+
+
+@dataclass
+class _InboundBurst:
+    chat_key: str
+    sender: str
+    entries: list[_InboundBurstEntry] = field(default_factory=list)
+    first_ts: float = 0.0
+    last_ts: float = 0.0
+    timer: Optional[asyncio.Task] = None
+
+
+def _burst_chat_key(value: Optional[str]) -> str:
+    """Canonical per-chat burst key unifying bare DM handles and full BlueBubbles chat GUIDs."""
+    _service, delimiter, identifier = _split_chat_guid(value)
+    if not identifier:
+        return ""
+    if delimiter == _GROUP_DELIMITER:
+        return f"{_GROUP_DELIMITER}{identifier.lower()}"
+    return f"{_DM_DELIMITER}{identifier.lower()}"
 
 
 def _ok():
@@ -556,6 +585,20 @@ class BlueBubblesInboundMixin:
                 break
             if not state.users and (state.retry_task is None or state.retry_task.done()):
                 self._inbound_messages.pop(message_id)
+        for chat_key, held_burst in list(getattr(predecessor, "_inbound_bursts", {}).items()):
+            if held_burst.timer is not None and not held_burst.timer.done():
+                held_burst.timer.cancel()
+            held_burst.timer = None
+            if not held_burst.entries:
+                continue
+            current_burst = self._inbound_bursts.get(chat_key)
+            if current_burst is None:
+                self._inbound_bursts[chat_key] = held_burst
+                self._arm_inbound_burst_timer(chat_key, held_burst)
+            else:
+                current_burst.entries = held_burst.entries + current_burst.entries
+                current_burst.first_ts = min(held_burst.first_ts, current_burst.first_ts)
+                self._arm_inbound_burst_timer(chat_key, current_burst)
 
     def _restore_admitted_content(self, state, message_id):
         """Restore only accepted content from the runner's reconnect-carried cache."""
@@ -737,8 +780,22 @@ class BlueBubblesInboundMixin:
             # Native admission keys by message GUID plus revision. New media or edit/unsend is a new input,
             # while the original GUID must remain intact for provider replies and reactions.
             event.edit_revision = edit_revision
+        raw_clean_text = (self._value(record.get("text"), record.get("message"), record.get("body")) or "").replace("\ufffc", "").strip()
+        if poll_summary := _format_poll_message(record):
+            raw_clean_text = poll_summary
+        elif is_group and self.require_mention and raw_clean_text:
+            raw_clean_text = self._clean_mention_text(raw_clean_text)
         try:
-            await self.handle_message(event)
+            await self._admit_inbound_event(
+                event,
+                chat_id=chat_id,
+                sender=sender,
+                message_id=message_id,
+                raw_clean_text=raw_clean_text,
+                pending_edit=pending_edit,
+                pending_unsend=pending_unsend,
+                edit_revision=edit_revision,
+            )
         finally:
             # Admission, not model/output completion, is the point of no replay.
             if event._gateway_accepted:
@@ -759,6 +816,262 @@ class BlueBubblesInboundMixin:
             task.add_done_callback(self._background_tasks.discard)
         return _ok()
 
+    def _inbound_burst_delay(self, chat_key: str, burst: _InboundBurst) -> float:
+        now = time.monotonic()
+        debounce_s = max(0.0, float(getattr(self, "inbound_debounce_seconds", 0.0) or 0.0))
+        max_s = max(debounce_s, float(getattr(self, "inbound_debounce_max_seconds", 10.0) or 10.0))
+        base_deadline = burst.last_ts + debounce_s
+        typing_until = getattr(self, "_chat_typing_until", {}).get(chat_key, 0.0)
+        desired = max(base_deadline, typing_until) if typing_until > now else base_deadline
+        deadline = min(desired, burst.first_ts + max_s)
+        return max(0.0, deadline - now)
+
+    @staticmethod
+    def _build_merged_burst_event(burst: _InboundBurst) -> Optional[MessageEvent]:
+        if not burst.entries:
+            return None
+        if len(burst.entries) == 1:
+            only = burst.entries[0]
+            only.event.text = only.text or ("(attachment)" if only.event.media_urls else "")
+            if not only.event.text:
+                return None
+            return only.event
+
+        first = burst.entries[0].event
+        last = burst.entries[-1].event
+        texts: list[str] = []
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        msg_type = MessageType.TEXT
+        reply_anchor: Optional[str] = None
+        for entry in burst.entries:
+            if entry.text:
+                texts.append(entry.text)
+            if entry.event.media_urls:
+                media_urls.extend(entry.event.media_urls)
+            if entry.event.media_types:
+                media_types.extend(entry.event.media_types)
+            if msg_type == MessageType.TEXT and entry.event.message_type != MessageType.TEXT:
+                msg_type = entry.event.message_type
+            if entry.event.reply_to_message_id:
+                reply_anchor = entry.event.reply_to_message_id
+
+        combined_text = "\n".join(texts).strip()
+        if not combined_text and media_urls:
+            combined_text = "(attachment)"
+        if not combined_text:
+            return None
+
+        merged_source = deepcopy(last.source)
+        if last.message_id:
+            merged_source.message_id = last.message_id
+        return MessageEvent(
+            text=combined_text,
+            message_type=msg_type,
+            source=merged_source,
+            raw_message=last.raw_message or first.raw_message,
+            message_id=last.message_id,
+            reply_to_message_id=reply_anchor,
+            media_urls=media_urls,
+            media_types=media_types,
+        )
+
+    def _discard_inbound_burst(self, chat_key: str) -> None:
+        bursts = getattr(self, "_inbound_bursts", None)
+        if not bursts:
+            return
+        burst = bursts.pop(chat_key, None)
+        if burst is not None and burst.timer is not None and not burst.timer.done():
+            burst.timer.cancel()
+        if burst is not None:
+            burst.timer = None
+
+    async def _flush_inbound_burst_now(self, chat_key: str) -> None:
+        bursts = getattr(self, "_inbound_bursts", None)
+        if not bursts:
+            return
+        burst = bursts.pop(chat_key, None)
+        if burst is None:
+            return
+        current = asyncio.current_task()
+        if burst.timer is not None and burst.timer is not current and not burst.timer.done():
+            burst.timer.cancel()
+        burst.timer = None
+        getattr(self, "_chat_typing_until", {}).pop(chat_key, None)
+        merged = self._build_merged_burst_event(burst)
+        if merged is not None:
+            await asyncio.shield(self.handle_message(merged))
+
+    def _arm_inbound_burst_timer(self, chat_key: str, burst: _InboundBurst) -> None:
+        if burst.timer is not None and not burst.timer.done():
+            burst.timer.cancel()
+        delay = self._inbound_burst_delay(chat_key, burst)
+
+        async def _fire() -> None:
+            this_task = asyncio.current_task()
+            try:
+                while True:
+                    await asyncio.sleep(delay)
+                    owner = getattr(self, "_inbound_bursts", {}).get(chat_key)
+                    if owner is not burst or burst.timer is not this_task:
+                        return
+                    remaining = self._inbound_burst_delay(chat_key, burst)
+                    if remaining <= 0.01:
+                        break
+                    delay_next = remaining
+                    await asyncio.sleep(delay_next)
+                    owner = getattr(self, "_inbound_bursts", {}).get(chat_key)
+                    if owner is not burst or burst.timer is not this_task:
+                        return
+                    if self._inbound_burst_delay(chat_key, burst) <= 0.01:
+                        break
+                await self._flush_inbound_burst_now(chat_key)
+            except asyncio.CancelledError:
+                return
+
+        task = asyncio.create_task(_fire())
+        burst.timer = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _admit_inbound_event(
+        self,
+        event: MessageEvent,
+        *,
+        chat_id: str,
+        sender: str,
+        message_id: Optional[str],
+        raw_clean_text: str,
+        pending_edit: bool,
+        pending_unsend: bool,
+        edit_revision: Optional[str],
+    ) -> None:
+        debounce_s = float(getattr(self, "inbound_debounce_seconds", 0.0) or 0.0)
+        chat_key = _burst_chat_key(chat_id)
+        bursts: dict[str, _InboundBurst] = self.__dict__.setdefault("_inbound_bursts", {})
+
+        has_handler = bool(getattr(self, "_message_handler", None)) or (
+            "handle_message" in self.__dict__
+        )
+        if debounce_s <= 0.0 or not chat_key or not has_handler:
+            await self.handle_message(event)
+            return
+        if hasattr(self, "_drop_unresolved") and self._drop_unresolved(event):
+            await self.handle_message(event)
+            return
+
+        # Edits / unsends / late attachments targeting a bubble STILL held in the pre-turn burst buffer.
+        existing = bursts.get(chat_key)
+        if existing is not None and edit_revision and message_id:
+            idx = next((i for i, item in enumerate(existing.entries) if item.message_id == message_id), None)
+            if idx is not None:
+                now = time.monotonic()
+                if pending_unsend:
+                    existing.entries.pop(idx)
+                    if not existing.entries:
+                        self._discard_inbound_burst(chat_key)
+                    else:
+                        existing.last_ts = now
+                        self._arm_inbound_burst_timer(chat_key, existing)
+                    event._gateway_accepted = True
+                    return
+                if pending_edit:
+                    existing.entries[idx].text = raw_clean_text
+                    existing.entries[idx].event.text = raw_clean_text
+                    existing.last_ts = now
+                    self._arm_inbound_burst_timer(chat_key, existing)
+                    event._gateway_accepted = True
+                    return
+                if edit_revision.startswith("attachments:"):
+                    if event.media_urls:
+                        existing.entries[idx].event.media_urls.extend(event.media_urls)
+                    if event.media_types:
+                        existing.entries[idx].event.media_types.extend(event.media_types)
+                    if existing.entries[idx].event.message_type == MessageType.TEXT and event.message_type != MessageType.TEXT:
+                        existing.entries[idx].event.message_type = event.message_type
+                    existing.last_ts = now
+                    self._arm_inbound_burst_timer(chat_key, existing)
+                    event._gateway_accepted = True
+                    return
+
+        # Slash commands, edits/unsends of already-dispatched messages, or active sessions bypass pre-turn holding.
+        cmd = event.get_command()
+        if not cmd and (event.text or "").strip().startswith("/"):
+            cmd = (event.text or "").strip()[1:].split(None, 1)[0].lower()
+        if cmd:
+            if cmd in _INTERRUPT_BYPASS_COMMANDS:
+                self._discard_inbound_burst(chat_key)
+            else:
+                await self._flush_inbound_burst_now(chat_key)
+            await self.handle_message(event)
+            return
+
+        if edit_revision:
+            await self._flush_inbound_burst_now(chat_key)
+            await self.handle_message(event)
+            return
+
+        session_key = self._event_session_key(event) if hasattr(self, "_event_session_key") else ""
+        if session_key and session_key in getattr(self, "_active_sessions", {}):
+            if hasattr(self, "_heal_stale_session_lock"):
+                self._heal_stale_session_lock(session_key)
+            if session_key in getattr(self, "_active_sessions", {}):
+                await self._flush_inbound_burst_now(chat_key)
+                await self.handle_message(event)
+                return
+
+        # Different sender in a group chat: flush prior sender's burst first to preserve attribution.
+        if existing is not None and existing.sender.lower() != (sender or "").lower():
+            await self._flush_inbound_burst_now(chat_key)
+            existing = None
+
+        now = time.monotonic()
+        entry = _InboundBurstEntry(
+            message_id=message_id,
+            text=raw_clean_text,
+            event=event,
+        )
+        if existing is None:
+            existing = _InboundBurst(
+                chat_key=chat_key,
+                sender=sender,
+                entries=[entry],
+                first_ts=now,
+                last_ts=now,
+            )
+            bursts[chat_key] = existing
+        else:
+            existing.entries.append(entry)
+            existing.last_ts = now
+        self._arm_inbound_burst_timer(chat_key, existing)
+        event._gateway_accepted = True
+
+    def _handle_typing_indicator_webhook(self, payload: dict[str, Any]) -> None:
+        record = self._extract_payload_record(payload) or {}
+        chat_guid = self._value(record.get("guid"), record.get("chatGuid"))
+        if not self._has_real_chat_guid(chat_guid):
+            return
+        is_group = self._is_group_record(record, chat_guid)
+        if not self._is_chat_allowed(chat_guid, is_group=is_group):
+            return
+        chat_key = _burst_chat_key(chat_guid)
+        if not chat_key:
+            return
+        typing_map: dict[str, float] = self.__dict__.setdefault("_chat_typing_until", {})
+        is_typing = bool(record.get("display"))
+        extend_s = float(getattr(self, "inbound_typing_extend_seconds", 0.0) or 0.0)
+        now = time.monotonic()
+        if is_typing and extend_s > 0.0:
+            typing_map[chat_key] = now + extend_s
+        else:
+            was_typing = typing_map.pop(chat_key, 0.0) > now
+            burst = getattr(self, "_inbound_bursts", {}).get(chat_key)
+            if was_typing and burst is not None:
+                burst.last_ts = max(burst.last_ts, now)
+        burst = getattr(self, "_inbound_bursts", {}).get(chat_key)
+        if burst is not None:
+            self._arm_inbound_burst_timer(chat_key, burst)
+
     async def _handle_webhook(self, request):
         from aiohttp import web
 
@@ -772,6 +1085,9 @@ class BlueBubblesInboundMixin:
             logger.exception("[bluebubbles] webhook parse error")
             return web.json_response({"error": "invalid payload"}, status=400)
         event_type = self._value(payload.get("type"), payload.get("event")) or ""
+        if event_type == _TYPING_EVENT:
+            self._handle_typing_indicator_webhook(payload)
+            return _ok()
         if event_type and event_type not in _MESSAGE_EVENTS:
             return _ok()
         record = self._extract_payload_record(payload) or {}

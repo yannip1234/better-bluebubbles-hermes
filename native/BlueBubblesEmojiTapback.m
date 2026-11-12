@@ -1163,6 +1163,48 @@ static void swizzled_handleMessage(id self, SEL _cmd, id netController, NSString
 // the edited message part, and backwardCompatabilityText is rewritten to 'Edited to "<text>"'.
 
 static IMP g_origEditMessageItem = NULL;
+static IMP g_origMarkAllMessagesAsRead = NULL;
+
+static void swizzled_markAllMessagesAsRead(id self, SEL _cmd) {
+    BOOL supportsRR = NO;
+    SEL supportsSel = sel_registerName("supportsSendingReadReceipts");
+    if ([self respondsToSelector:supportsSel]) {
+        supportsRR = ((BOOL(*)(id, SEL))objc_msgSend)(self, supportsSel);
+    }
+    if (supportsRR) {
+        NSDictionary *props = nil;
+        SEL propsSel = sel_registerName("properties");
+        if ([self respondsToSelector:propsSel]) {
+            id rawProps = ((id(*)(id, SEL))objc_msgSend)(self, propsSel);
+            if ([rawProps isKindOfClass:[NSDictionary class]]) {
+                props = (NSDictionary *)rawProps;
+            }
+        }
+        id perChatFlag = props ? (props[@"EnableReadReceiptForChat"] ?: props[@"enableReadReceiptForChat"]) : nil;
+        if (![perChatFlag respondsToSelector:@selector(boolValue)] || ![perChatFlag boolValue]) {
+            SEL toggleSel = sel_registerName("userToggledReadReceiptSwitch:");
+            if ([self respondsToSelector:toggleSel]) {
+                ((void(*)(id, SEL, BOOL))objc_msgSend)(self, toggleSel, YES);
+            }
+        }
+    }
+
+    if (g_origMarkAllMessagesAsRead != NULL) {
+        ((void(*)(id, SEL))g_origMarkAllMessagesAsRead)(self, _cmd);
+    }
+
+    if (supportsRR) {
+        Class regCls = objc_getClass("IMChatRegistry");
+        SEL sharedSel = sel_registerName("sharedInstance");
+        SEL sendAllSel = sel_registerName("_chat_sendReadReceiptForAllMessages:");
+        if (regCls && [regCls respondsToSelector:sharedSel]) {
+            id registry = ((id(*)(id, SEL))objc_msgSend)(regCls, sharedSel);
+            if (registry && [registry respondsToSelector:sendAllSel]) {
+                ((void(*)(id, SEL, id))objc_msgSend)(registry, sendAllSel, self);
+            }
+        }
+    }
+}
 
 static NSString *extractPlainString(id attrOrStr) {
     if ([attrOrStr isKindOfClass:[NSAttributedString class]]) {
@@ -1342,13 +1384,18 @@ static void initBlueBubblesEmojiTapbackSwizzle(void) {
                     imChatCls, oldEditSel, (IMP)compat_editMessageItem, "v48@0:8@16q24@32@40"
                 );
             }
+            Method markReadMethod = class_getInstanceMethod(imChatCls, sel_registerName("markAllMessagesAsRead"));
+            if (markReadMethod) {
+                g_origMarkAllMessagesAsRead = method_setImplementation(markReadMethod, (IMP)swizzled_markAllMessagesAsRead);
+            }
         }
 
-        os_log(log, "BLUEBUBBLESHELPER: Emoji tapback swizzle initialized (parse=%d, verb=%d, immsg=%d, handle=%d, editCompat=%d)",
+        os_log(log, "BLUEBUBBLESHELPER: Emoji tapback swizzle initialized (parse=%d, verb=%d, immsg=%d, handle=%d, editCompat=%d, markRead=%d)",
                g_origParseReactionType != NULL,
                g_origReactionToVerb != NULL,
                g_origInitWithSender != NULL,
                g_origHandleMessage != NULL,
-               addedEditCompat);
+               addedEditCompat,
+               g_origMarkAllMessagesAsRead != NULL);
     }
 }

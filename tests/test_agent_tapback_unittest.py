@@ -834,5 +834,135 @@ class ToolRuntimeTest(unittest.TestCase):
 
         asyncio.run(run_send_and_edit())
 
+    def test_pre_turn_burst_grouping_typing_hold_and_in_window_edit_unsend(self):
+        class FakeWebhookReq:
+            def __init__(self, payload: dict):
+                self.query = {"password": "pw"}
+                self.headers = {}
+                self._raw = json.dumps(payload).encode("utf-8")
+
+            async def read(self) -> bytes:
+                return self._raw
+
+        async def run_burst_suite():
+            dispatched = []
+
+            async def capture_handle(event):
+                event._gateway_accepted = True
+                dispatched.append(event)
+
+            adapter = BlueBubblesAdapter(
+                PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "server_url": "http://127.0.0.1:1234",
+                        "password": "pw",
+                        "send_read_receipts": False,
+                        "require_mention": False,
+                        "inbound_debounce_seconds": 0.08,
+                        "inbound_typing_extend_seconds": 0.22,
+                        "inbound_debounce_max_seconds": 0.60,
+                    },
+                )
+            )
+            adapter.handle_message = capture_handle
+            self.assertEqual(
+                adapter._desired_webhook_events(),
+                ("new-message", "updated-message", "typing-indicator"),
+            )
+
+            def msg_payload(guid: str, text: str, *, sender: str = "+15551234567", chat_guid: str = "iMessage;-;+15551234567", style: int = 45, date_edited: int = 0, date_retracted: int = 0, event_type: str = "new-message"):
+                rec = {
+                    "guid": guid,
+                    "text": text,
+                    "handle": {"address": sender},
+                    "chats": [{"guid": chat_guid, "style": style}],
+                    "attachments": [],
+                }
+                if date_edited:
+                    rec["dateEdited"] = date_edited
+                if date_retracted:
+                    rec["dateRetracted"] = date_retracted
+                return {"type": event_type, "data": rec}
+
+            # 1. Rapid 6-bubble burst ("so", "you", "reply", "to", "all", "this?") -> single turn!
+            for idx, word in enumerate(["so", "you", "reply", "to", "all", "this?"], start=1):
+                resp = await adapter._handle_webhook(FakeWebhookReq(msg_payload(f"b-{idx}", word)))
+                self.assertEqual(resp.status, 200)
+                await asyncio.sleep(0.015)
+
+            self.assertEqual(len(dispatched), 0)
+            await asyncio.sleep(0.12)
+            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(dispatched[0].text, "so\nyou\nreply\nto\nall\nthis?")
+            self.assertEqual(dispatched[0].message_id, "b-6")
+            self.assertEqual(dispatched[0].source.message_id, "b-6")
+
+            # 2. Typing indicator extends the quiet window while the user keeps typing, then flushes cleanly.
+            dispatched.clear()
+            await adapter._handle_webhook(FakeWebhookReq(msg_payload("t-1", "first thought")))
+            await asyncio.sleep(0.03)
+            await adapter._handle_webhook(
+                FakeWebhookReq(
+                    {"type": "typing-indicator", "data": {"display": True, "guid": "iMessage;-;+15551234567"}}
+                )
+            )
+            # Past normal 0.08s debounce, still held because user is typing (0.22s typing hold)
+            await asyncio.sleep(0.09)
+            self.assertEqual(len(dispatched), 0)
+            # User hits Send: typing-indicator display=False arrives slightly BEFORE new-message
+            await adapter._handle_webhook(
+                FakeWebhookReq(
+                    {"type": "typing-indicator", "data": {"display": False, "guid": "iMessage;-;+15551234567"}}
+                )
+            )
+            await asyncio.sleep(0.02)
+            self.assertEqual(len(dispatched), 0)
+            await adapter._handle_webhook(FakeWebhookReq(msg_payload("t-2", "second thought")))
+            await asyncio.sleep(0.12)
+            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(dispatched[0].text, "first thought\nsecond thought")
+            self.assertEqual(dispatched[0].message_id, "t-2")
+
+            # 3. In-window edit and unsend update/remove buffered bubbles cleanly before dispatch.
+            dispatched.clear()
+            await adapter._handle_webhook(FakeWebhookReq(msg_payload("e-1", "typo line")))
+            await adapter._handle_webhook(FakeWebhookReq(msg_payload("e-2", "remove me")))
+            await adapter._handle_webhook(
+                FakeWebhookReq(msg_payload("e-1", "fixed line", date_edited=100, event_type="updated-message"))
+            )
+            await adapter._handle_webhook(
+                FakeWebhookReq(msg_payload("e-2", "remove me", date_retracted=200, event_type="updated-message"))
+            )
+            await asyncio.sleep(0.12)
+            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(dispatched[0].text, "fixed line")
+            self.assertEqual(dispatched[0].message_id, "e-1")
+
+            # 4. Different senders in a group chat never merge into each other's burst.
+            dispatched.clear()
+            grp = "iMessage;+;chat0123456789abcdef0123456789ab"
+            await adapter._handle_webhook(
+                FakeWebhookReq(msg_payload("g-1", "alice part 1", sender="+15551111111", chat_guid=grp, style=43))
+            )
+            await adapter._handle_webhook(
+                FakeWebhookReq(msg_payload("g-2", "bob interjects", sender="+15552222222", chat_guid=grp, style=43))
+            )
+            # Alice's burst flushed immediately when Bob spoke!
+            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(dispatched[0].text, "alice part 1")
+            self.assertEqual(dispatched[0].source.user_id, "+15551111111")
+            await asyncio.sleep(0.12)
+            self.assertEqual(len(dispatched), 2)
+            self.assertEqual(dispatched[1].text, "bob interjects")
+            self.assertEqual(dispatched[1].source.user_id, "+15552222222")
+
+        asyncio.run(run_burst_suite())
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
 
 

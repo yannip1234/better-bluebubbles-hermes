@@ -126,6 +126,9 @@ hermes bluebubbles-config sync --restart
 | `BLUEBUBBLES_WEBHOOK_HOST` | Webhook bind host (default `127.0.0.1`) |
 | `BLUEBUBBLES_WEBHOOK_PORT` | Webhook bind port (default `8645`) |
 | `BLUEBUBBLES_WEBHOOK_PATH` | Webhook path (default `/bluebubbles-webhook`) |
+| `BLUEBUBBLES_INBOUND_DEBOUNCE_SECONDS` | Pre-turn quiet window (s) to batch rapid multi-bubble texts into one turn (default `1.5`, `0` disables) |
+| `BLUEBUBBLES_INBOUND_TYPING_EXTEND_SECONDS` | Hold window (s) while iMessage `typing-indicator` reports active typing (default `5.5`, `0` disables) |
+| `BLUEBUBBLES_INBOUND_DEBOUNCE_MAX_SECONDS` | Hard cap (s) on pre-turn burst buffering from the first bubble (default `10.0`) |
 
 ### Sharing one BlueBubbles server across multiple profiles
 

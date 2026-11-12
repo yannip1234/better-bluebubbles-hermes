@@ -73,6 +73,9 @@ _IMESSAGE_EDIT_WINDOW_SECONDS = 840.0  # 14m safety margin under Apple's 15m edi
 DEFAULT_WORKING_PLACEHOLDER_TEXT = "⏳ Working on it..."
 DEFAULT_WORKING_PLACEHOLDER_DELAY = 2.0
 DEFAULT_THINKING_TAPBACK_DELAY = 1.0
+DEFAULT_INBOUND_DEBOUNCE_SECONDS = 1.5
+DEFAULT_INBOUND_TYPING_EXTEND_SECONDS = 5.5
+DEFAULT_INBOUND_DEBOUNCE_MAX_SECONDS = 10.0
 
 
 def _turn_chat_key(value: Optional[str]) -> str:
@@ -859,12 +862,38 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             else DEFAULT_WORKING_PLACEHOLDER_TEXT
         )
 
+        def _parse_float_setting(extra_key: str, env_key: str, default: float) -> float:
+            raw = extra.get(extra_key) if extra_key in extra else _get_scoped_secret(env_key)
+            if raw is None or str(raw).strip() == "":
+                return default
+            try:
+                val = float(raw)
+                return val if val >= 0.0 else default
+            except (TypeError, ValueError):
+                return default
+
+        self.inbound_debounce_seconds: float = _parse_float_setting(
+            "inbound_debounce_seconds", "BLUEBUBBLES_INBOUND_DEBOUNCE_SECONDS", DEFAULT_INBOUND_DEBOUNCE_SECONDS
+        )
+        self.inbound_typing_extend_seconds: float = _parse_float_setting(
+            "inbound_typing_extend_seconds",
+            "BLUEBUBBLES_INBOUND_TYPING_EXTEND_SECONDS",
+            DEFAULT_INBOUND_TYPING_EXTEND_SECONDS,
+        )
+        self.inbound_debounce_max_seconds: float = _parse_float_setting(
+            "inbound_debounce_max_seconds",
+            "BLUEBUBBLES_INBOUND_DEBOUNCE_MAX_SECONDS",
+            DEFAULT_INBOUND_DEBOUNCE_MAX_SECONDS,
+        )
+
         self.client: Optional[httpx.AsyncClient] = None
         self._runner = None
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
         self._inbound_messages: OrderedDict[str, _InboundMessage] = OrderedDict()
+        self._inbound_bursts: dict[str, Any] = {}
+        self._chat_typing_until: dict[str, float] = {}
         self._inbound_routing_lock = asyncio.Lock()
         self._inbound_chat_tails = {}
         self._sent_tapbacks: OrderedDict[tuple[str, str], str] = OrderedDict()
@@ -1238,6 +1267,14 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             self.client = None
 
     async def disconnect(self) -> None:
+        burst_timers = [
+            b.timer for b in self._inbound_bursts.values()
+            if getattr(b, "timer", None) is not None and not b.timer.done()
+        ]
+        for task in burst_timers:
+            task.cancel()
+        if burst_timers:
+            await asyncio.gather(*burst_timers, return_exceptions=True)
         retries = [state.retry_task for state in self._inbound_messages.values()
                    if state.retry_task is not None]
         for task in retries:
@@ -1286,6 +1323,11 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             raise ValueError("BlueBubbles webhook list response did not contain a list")
         return [wh for wh in data if isinstance(wh, dict) and wh.get("url") == url]
 
+    def _desired_webhook_events(self) -> tuple[str, ...]:
+        if self.inbound_debounce_seconds > 0.0 and self.inbound_typing_extend_seconds > 0.0:
+            return (*_WEBHOOK_EVENTS, "typing-indicator")
+        return _WEBHOOK_EVENTS
+
     async def _register_webhook(self) -> bool:
         """Ensure the same-URL registration has the desired inbound event set.
 
@@ -1296,7 +1338,8 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         if not self.client:
             return False
         webhook_url, log_url = self._webhook_register_url, self._webhook_register_url_for_log
-        desired = set(_WEBHOOK_EVENTS)
+        desired_list = list(self._desired_webhook_events())
+        desired = set(desired_list)
         existing: list[dict] = []
         try:
             existing = await self._find_registered_webhooks(webhook_url)
@@ -1315,7 +1358,7 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                     await self._delete_webhook_id(wh["id"])
 
             res = await self._api_post(
-                "/api/v1/webhook", {"url": webhook_url, "events": list(_WEBHOOK_EVENTS)})
+                "/api/v1/webhook", {"url": webhook_url, "events": desired_list})
             status = res.get("status", 0)
             data = res.get("data") or {}
             if not 200 <= status < 300 or not isinstance(data, dict) or set(data.get("events") or []) != desired:

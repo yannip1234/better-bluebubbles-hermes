@@ -82,3 +82,15 @@ optional_env:
     description: "Ignore group chats (;+; GUIDs) on this profile (default false)"
     prompt: "Ignore group messages? (true/false)"
     password: false
+  - name: BLUEBUBBLES_INBOUND_DEBOUNCE_SECONDS
+    description: "Pre-turn quiet window in seconds to coalesce rapid multi-bubble messages before starting a turn (default 1.5; 0 disables)"
+    prompt: "Inbound burst quiet window (seconds)"
+    password: false
+  - name: BLUEBUBBLES_INBOUND_TYPING_EXTEND_SECONDS
+    description: "Extra hold window in seconds while BlueBubbles reports the sender is actively typing (default 5.5; 0 disables)"
+    prompt: "Typing-indicator hold window (seconds)"
+    password: false
+  - name: BLUEBUBBLES_INBOUND_DEBOUNCE_MAX_SECONDS
+    description: "Maximum total seconds to buffer an inbound message burst before forcing turn start (default 10.0)"
+    prompt: "Inbound burst max hold (seconds)"
+    password: false
