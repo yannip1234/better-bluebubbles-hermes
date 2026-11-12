@@ -132,7 +132,10 @@ def _extract_poll_json_from_payload_data(raw_payload: Any) -> Optional[dict[str,
     return None
 
 
-def _format_poll_message(record: dict[str, Any]) -> Optional[str]:
+def _format_poll_message(
+    record: dict[str, Any],
+    option_labels: Optional[dict[str, str]] = None,
+) -> Optional[str]:
     if not _is_poll_record(record):
         return None
     msg_guid = str(record.get("guid") or record.get("messageGuid") or "").strip()
@@ -159,14 +162,17 @@ def _format_poll_message(record: dict[str, Any]) -> Optional[str]:
             return f'[Poll: "{title}"{id_Tag}] Options: ' + "; ".join(opt_parts)
         votes = item.get("votes")
         if isinstance(votes, list) and votes:
-            vote_ids = [
-                str(v.get("voteOptionIdentifier") or "").strip()
-                for v in votes
-                if isinstance(v, dict) and v.get("voteOptionIdentifier")
-            ]
+            vote_parts = []
+            for v in votes:
+                if not isinstance(v, dict) or not v.get("voteOptionIdentifier"):
+                    continue
+                vid = str(v.get("voteOptionIdentifier") or "").strip()
+                label = (option_labels or {}).get(vid)
+                vote_parts.append(f'"{label}" (id={vid})' if label else vid)
             target_id = assoc_guid or msg_guid
             id_tag = f" on poll {target_id}" if target_id else ""
-            return f"[Poll vote{id_tag}]: option(s) {', '.join(vote_ids)}"
+            if vote_parts:
+                return f"[Poll vote{id_tag}]: option(s) {', '.join(vote_parts)}"
 
     raw_text = str(record.get("text") or record.get("message") or record.get("body") or "").replace("\ufffc", "").strip()
     target_id = assoc_guid or msg_guid
@@ -500,7 +506,50 @@ class BlueBubblesInboundMixin:
         return any(isinstance(att, dict) and att.get("guid") and att["guid"] not in state.delivered
                    for att in _user_attachments(state.record))
 
-    async def _hydrate_inbound_record(self, message_id: Optional[str]) -> dict[str, Any]:
+    async def _resolve_poll_option_labels(
+        self,
+        record: dict[str, Any],
+        message_id: Optional[str],
+        assoc_guid: str,
+    ) -> dict[str, str]:
+        cache: dict[str, dict[str, str]] = getattr(self, "_poll_option_labels", {})
+        if not hasattr(self, "_poll_option_labels"):
+            self._poll_option_labels = cache
+
+        def _cache_from_record(rec: dict[str, Any], key: str) -> dict[str, str]:
+            poll_obj = _extract_poll_json_from_payload_data(rec.get("payloadData"))
+            if not isinstance(poll_obj, dict) or not isinstance(poll_obj.get("item"), dict):
+                return {}
+            options = poll_obj["item"].get("orderedPollOptions")
+            if not isinstance(options, list):
+                return {}
+            labels = {
+                str(opt.get("optionIdentifier") or "").strip(): str(opt.get("text") or "").strip()
+                for opt in options
+                if isinstance(opt, dict) and opt.get("optionIdentifier") and opt.get("text")
+            }
+            if labels and key:
+                cache[key] = labels
+            return labels
+
+        target_id = assoc_guid or (message_id or "")
+        if message_id:
+            _cache_from_record(record, target_id or message_id)
+        if target_id and target_id in cache:
+            return cache[target_id]
+        if assoc_guid and self.client:
+            with suppress(httpx.HTTPError, OSError, ValueError, TimeoutError):
+                parent = await self._hydrate_inbound_record(assoc_guid, include_payload=True)
+                if isinstance(parent, dict):
+                    return _cache_from_record(parent, assoc_guid)
+        return cache.get(target_id, {})
+
+    async def _hydrate_inbound_record(
+        self,
+        message_id: Optional[str],
+        *,
+        include_payload: bool = False,
+    ) -> dict[str, Any]:
         """Fetch routing and attachment relationships with bounded in-request retries.
 
         BlueBubbles does not retry failed webhook POSTs, so transient API/relationship lag has to be
@@ -510,12 +559,13 @@ class BlueBubblesInboundMixin:
             return {}
         last_error: Optional[Exception] = None
         last_record: dict[str, Any] = {}
+        with_fields = "chats,attachments,payloadData" if include_payload else "chats,attachments"
         for delay in _HYDRATE_RETRY_DELAYS:
             if delay:
                 await asyncio.sleep(delay)
             try:
                 data = (await self._api_get(
-                    f"/api/v1/message/{quote(message_id, safe='')}?with=chats,attachments")).get("data")
+                    f"/api/v1/message/{quote(message_id, safe='')}?with={with_fields}")).get("data")
                 last_error = None
             except (httpx.HTTPError, OSError, ValueError) as exc:
                 last_error = exc
@@ -704,10 +754,21 @@ class BlueBubblesInboundMixin:
         pending_unsend = state.accepted and retracted_ts > 0 and not state.retracted
         pending_edit = state.accepted and not pending_unsend and edited_ts > state.last_edit_ts
         text = (self._value(record.get("text"), record.get("message"), record.get("body")) or "").replace("\ufffc", "").strip()
-        if _is_poll_record(record) and not record.get("payloadData") and self.client:
-            with suppress(httpx.HTTPError, OSError, ValueError, TimeoutError):
-                self._merge_inbound_record(record, await self._hydrate_inbound_record(message_id))
-        if poll_summary := _format_poll_message(record):
+        poll_option_labels: Optional[dict[str, str]] = None
+        if _is_poll_record(record):
+            assoc_raw = str(record.get("associatedMessageGuid") or "").strip()
+            if assoc_raw.startswith("bp:") or assoc_raw.startswith("p:0/"):
+                assoc_raw = assoc_raw.split(":", 1)[-1].split("/", 1)[-1]
+            if hasattr(self, "_remember_poll_message_guid"):
+                self._remember_poll_message_guid(message_id, assoc_raw)
+            if not record.get("payloadData") and self.client:
+                with suppress(httpx.HTTPError, OSError, ValueError, TimeoutError):
+                    self._merge_inbound_record(
+                        record,
+                        await self._hydrate_inbound_record(message_id, include_payload=True),
+                    )
+            poll_option_labels = await self._resolve_poll_option_labels(record, message_id, assoc_raw)
+        if poll_summary := _format_poll_message(record, option_labels=poll_option_labels):
             text = poll_summary
         # Known unmentioned group text needs no media I/O; sparse text can still hydrate below.
         if is_group and self.require_mention and not pending_unsend and text and not self._message_matches_mention_patterns(text):
@@ -722,7 +783,7 @@ class BlueBubblesInboundMixin:
             except (httpx.HTTPError, OSError, ValueError, TimeoutError) as exc:
                 logger.warning("[bluebubbles] attachment hydration failed: %s", type(exc).__name__)
         text = (self._value(record.get("text"), record.get("message"), record.get("body")) or "").replace("\ufffc", "").strip()
-        if poll_summary := _format_poll_message(record):
+        if poll_summary := _format_poll_message(record, option_labels=poll_option_labels):
             text = poll_summary
         if is_group and self.require_mention:
             if not pending_unsend and not self._message_matches_mention_patterns(text):
@@ -781,7 +842,7 @@ class BlueBubblesInboundMixin:
             # while the original GUID must remain intact for provider replies and reactions.
             event.edit_revision = edit_revision
         raw_clean_text = (self._value(record.get("text"), record.get("message"), record.get("body")) or "").replace("\ufffc", "").strip()
-        if poll_summary := _format_poll_message(record):
+        if poll_summary := _format_poll_message(record, option_labels=poll_option_labels):
             raw_clean_text = poll_summary
         elif is_group and self.require_mention and raw_clean_text:
             raw_clean_text = self._clean_mention_text(raw_clean_text)

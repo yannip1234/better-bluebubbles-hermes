@@ -1113,6 +1113,89 @@ class TestBlueBubblesProfileRouting:
         assert "OPT-2" in handled[1].text
 
     @pytest.mark.asyncio
+    async def test_inbound_poll_vote_hydrates_payload_and_suppresses_reply_anchor(self, monkeypatch):
+        import base64
+        import json
+        import plistlib
+
+        adapter, handled = self._capture(monkeypatch)
+        dm = {"guid": "iMessage;-;+15551234567", "chatIdentifier": "+15551234567", "style": 45}
+        poll_balloon_id = "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.messages.Polls"
+        parent_json = {
+            "item": {
+                "title": "Which account?",
+                "orderedPollOptions": [
+                    {"optionIdentifier": "OPT-1", "text": "option_a"},
+                    {"optionIdentifier": "OPT-2", "text": "option_b"},
+                ],
+            }
+        }
+        vote_json = {"item": {"votes": [{"voteOptionIdentifier": "OPT-1", "participantHandle": "+15551234567"}]}}
+        parent_bplist = plistlib.dumps(
+            {"$objects": ["$null", f"data:,{base64.b64encode(json.dumps(parent_json).encode()).decode()}"]},
+            fmt=plistlib.FMT_BINARY,
+        )
+        vote_bplist = plistlib.dumps(
+            {"$objects": ["$null", f"data:,{base64.b64encode(json.dumps(vote_json).encode()).decode()}"]},
+            fmt=plistlib.FMT_BINARY,
+        )
+
+        hydrated_urls = []
+        sent_payloads = []
+
+        def transport(request):
+            if request.method == "GET":
+                hydrated_urls.append(str(request.url))
+                if request.url.path == "/api/v1/message/poll-vote-2":
+                    return httpx.Response(200, json={"data": {
+                        "guid": "poll-vote-2",
+                        "chats": [dm],
+                        "balloonBundleId": poll_balloon_id,
+                        "associatedMessageGuid": "poll-parent-1",
+                        "payloadData": vote_bplist.hex(),
+                    }})
+                if request.url.path == "/api/v1/message/poll-parent-1":
+                    return httpx.Response(200, json={"data": {
+                        "guid": "poll-parent-1",
+                        "chats": [dm],
+                        "balloonBundleId": poll_balloon_id,
+                        "payloadData": parent_bplist.hex(),
+                    }})
+            if request.method == "POST" and request.url.path == "/api/v1/message/text":
+                sent_payloads.append(json.loads(request.content.decode()))
+                return httpx.Response(200, json={"data": {"guid": "sent-reply-1"}})
+            raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            adapter.client = client
+            resp = await adapter._handle_webhook(
+                _FakeBlueBubblesRequest(
+                    self._payload(
+                        "new-message",
+                        guid="poll-vote-2",
+                        chat=dm,
+                        text="",
+                        balloonBundleId=poll_balloon_id,
+                        associatedMessageGuid="poll-parent-1",
+                    )
+                )
+            )
+            assert resp.status == 200
+            assert len(handled) == 1
+            assert "[Poll vote on poll poll-parent-1]" in handled[0].text
+            assert '"option_a"' in handled[0].text
+            assert any("with=chats,attachments,payloadData" in u for u in hydrated_urls)
+
+            # Simulate an active turn replying to the poll vote: must NOT set selectedMessageGuid
+            adapter._private_api_enabled = True
+            adapter._helper_connected = True
+            adapter._active_turn_chats[dm["guid"]] = "sess-1"
+            assert adapter._is_poll_event(handled[0])
+            await adapter.send(dm["guid"], "Using option_a", reply_to="poll-vote-2")
+            assert len(sent_payloads) == 1
+            assert "selectedMessageGuid" not in sent_payloads[0]
+
+    @pytest.mark.asyncio
     async def test_sticker_tapback_ignored_by_webhook(self, monkeypatch):
         adapter, handled = self._capture(monkeypatch)
         dm = {"guid": "iMessage;-;+15551234567", "chatIdentifier": "+15551234567", "style": 45}

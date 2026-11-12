@@ -43,6 +43,7 @@ from .inbound import (
     _canonical_chat_guid_key,
     _chat_guid_delimiter,
     _is_dm_chat_guid,
+    _is_poll_record,
     _is_group_chat_guid,
     _split_chat_guid,
 )
@@ -912,8 +913,36 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         self._turn_agent_tapback_override: set[str] = set()
         self._contact_name_cache: dict[str, str] = {}
         self._contact_name_cache_ts: float = 0.0
+        self._poll_message_guids: OrderedDict[str, bool] = OrderedDict()
+        self._poll_option_labels: dict[str, dict[str, str]] = {}
         # The runner carries this shared cache across adapter rebuilds. Store only accepted content.
         self._dedup = MessageDeduplicator(max_size=2000, ttl_seconds=48 * 3600)
+
+    def _remember_poll_message_guid(self, *guids: Optional[str]) -> None:
+        if not hasattr(self, "_poll_message_guids"):
+            self._poll_message_guids = OrderedDict()
+        for guid in guids:
+            cleaned = (guid or "").strip()
+            if not cleaned:
+                continue
+            self._poll_message_guids.pop(cleaned, None)
+            self._poll_message_guids[cleaned] = True
+            while len(self._poll_message_guids) > 512:
+                self._poll_message_guids.popitem(last=False)
+
+    def _is_poll_reply_target(self, guid: Optional[str]) -> bool:
+        cleaned = (guid or "").strip()
+        return bool(cleaned and cleaned in getattr(self, "_poll_message_guids", ()))
+
+    def _is_poll_event(self, event: Any) -> bool:
+        raw = getattr(event, "raw_message", None)
+        data = raw.get("data") if isinstance(raw, dict) else None
+        if isinstance(data, dict) and _is_poll_record(data):
+            return True
+        return (
+            self._is_poll_reply_target(getattr(event, "message_id", None))
+            or self._is_poll_reply_target(getattr(event, "reply_to_message_id", None))
+        )
 
     async def _dispatch_inline_reply(self, event, *, log_cmd=None):
         # Installed core predates PR 116401's inline admission receipt.
@@ -1002,11 +1031,13 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             self._turn_agent_tapback_override.discard(turn_key)
             self._turn_status_tapbacks.pop(turn_key, None)
             self._active_turn_chats[turn_key] = session_key
-            if event.message_id:
+            is_poll_event = self._is_poll_event(event)
+            if event.message_id and not is_poll_event:
                 self._turn_reply_to[turn_key] = event.message_id
             if (
                 self.status_tapbacks_enabled
                 and event.message_id
+                and not is_poll_event
                 and self._private_api_enabled
                 and self._helper_connected
                 and self.client is not None
@@ -1055,7 +1086,7 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                             await self.send(
                                 chat_id,
                                 self.working_placeholder_text,
-                                reply_to=event.message_id,
+                                reply_to=None if is_poll_event else event.message_id,
                                 metadata={"_interim_send": True, "_working_placeholder": True},
                             )
                     except asyncio.CancelledError:
@@ -1604,6 +1635,8 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                     metadata={**meta, "_rich_ranges": single_ranges},
                 )
             reply_anchor = reply_to or self._turn_reply_to.get(turn_key)
+            if self._is_poll_reply_target(reply_anchor):
+                reply_anchor = None
             guid = await self._resolve_chat_guid(chat_id)
             if not guid or not self._is_chat_allowed(
                 guid, chat_identifier=chat_id, is_group=_is_group_chat_guid(guid)
@@ -1681,7 +1714,7 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
                 return SendResult(success=False, error=f"BlueBubbles chat not allowed for this profile: {guid}")
             payload = {"chatGuid": guid, "tempGuid": _temp_guid(), "message": chunk}
             if self._private_api_enabled and self._helper_connected:
-                if reply_to and idx == 0:
+                if reply_to and idx == 0 and not self._is_poll_reply_target(reply_to):
                     payload.update(method="private-api", selectedMessageGuid=reply_to, partIndex=0)
                 if subject and idx == 0:
                     payload.update(method="private-api", subject=subject)
@@ -1769,13 +1802,14 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             payload["effectId"] = effect_id
         if cleaned_subject:
             payload["subject"] = cleaned_subject
-        if reply_to:
+        if reply_to and not self._is_poll_reply_target(reply_to):
             payload["selectedMessageGuid"] = reply_to
             payload["partIndex"] = 0
         res = await self._post_message("/api/v1/message/text", payload)
         if not res.success:
             return {"success": False, "error": res.error}
         self._remember_sent_message(chat_id, guid, res.message_id)
+        self._remember_poll_message_guid(res.message_id)
         out: dict[str, Any] = {
             "success": True,
             "message_id": res.message_id,
@@ -1863,13 +1897,14 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
         }
         if cleaned_subject:
             payload["subject"] = cleaned_subject
-        if reply_to:
+        if reply_to and not self._is_poll_reply_target(reply_to):
             payload["selectedMessageGuid"] = reply_to
             payload["partIndex"] = 0
         res = await self._post_message("/api/v1/message/text", payload)
         if not res.success:
             return {"success": False, "error": res.error}
         self._remember_sent_message(chat_id, guid, res.message_id)
+        self._remember_poll_message_guid(res.message_id)
         return {
             "success": True,
             "message_id": res.message_id,
@@ -1925,13 +1960,14 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             "method": "private-api",
             "effectId": _encode_custom_effect_spec(spec),
         }
-        if reply_to:
+        if reply_to and not self._is_poll_reply_target(reply_to):
             payload["selectedMessageGuid"] = reply_to
             payload["partIndex"] = 0
         res = await self._post_message("/api/v1/message/text", payload)
         if not res.success:
             return {"success": False, "error": res.error}
         self._remember_sent_message(chat_id, guid, res.message_id)
+        self._remember_poll_message_guid(res.message_id)
         return {
             "success": True,
             "message_id": res.message_id,
@@ -2372,7 +2408,7 @@ class BlueBubblesAdapter(BlueBubblesInboundMixin, BasePlatformAdapter):
             if is_audio_message:
                 data["isAudioMessage"] = "true"
             if self._private_api_enabled and self._helper_connected:
-                if reply_to:
+                if reply_to and not self._is_poll_reply_target(reply_to):
                     data["method"] = "private-api"
                     data["selectedMessageGuid"] = reply_to
                     data["partIndex"] = "0"
